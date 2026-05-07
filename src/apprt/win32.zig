@@ -305,6 +305,18 @@ extern "kernel32" fn GlobalSize(?*anyopaque) callconv(.winapi) usize;
 extern "gdi32" fn ChoosePixelFormat(HDC, *const PIXELFORMATDESCRIPTOR) callconv(.winapi) c_int;
 extern "gdi32" fn SetPixelFormat(HDC, c_int, *const PIXELFORMATDESCRIPTOR) callconv(.winapi) BOOL;
 extern "gdi32" fn SwapBuffers(HDC) callconv(.winapi) BOOL;
+extern "gdi32" fn CreateSolidBrush(u32) callconv(.winapi) ?*anyopaque;
+extern "user32" fn FillRect(HDC, *const RECT, ?*anyopaque) callconv(.winapi) c_int;
+extern "gdi32" fn DeleteObject(?*anyopaque) callconv(.winapi) BOOL;
+
+fn win32CreateSolidBrush(rgb: u32) ?*anyopaque {
+    // COLORREF = 0x00BBGGRR
+    const r = (rgb >> 16) & 0xFF;
+    const g = (rgb >> 8) & 0xFF;
+    const b = rgb & 0xFF;
+    const colorref = (r) | (g << 8) | (b << 16);
+    return CreateSolidBrush(colorref);
+}
 
 // ── WGL extern functions ──────────────────────────────
 extern "opengl32" fn wglCreateContext(HDC) callconv(.winapi) ?HGLRC;
@@ -695,6 +707,7 @@ fn wndProc(hwnd: HWND, msg_type: u32, wparam: WPARAM, lparam: LPARAM) callconv(.
         WM_DPICHANGED => {
             if (app) |a| {
                 a.dpi = @truncate(wparam & 0xFFFF);
+                a.tab_bar_height = App.computeTabBarHeight(a.dpi);
                 const suggested: *const RECT = @ptrFromInt(@as(usize, @bitCast(lparam)));
                 _ = SetWindowPos(
                     hwnd,
@@ -723,16 +736,16 @@ fn wndProc(hwnd: HWND, msg_type: u32, wparam: WPARAM, lparam: LPARAM) callconv(.
         WM_SIZE => {
             if (app) |a| {
                 const wparam_val: u32 = @intCast(wparam & 0xFFFF);
-                // Skip minimized: width/height are 0, which would break
-                // ResizePseudoConsole and the OpenGL viewport.
                 if (wparam_val == SIZE_MINIMIZED) return 0;
                 const width: u32 = @intCast(lparam & 0xFFFF);
                 const height: u32 = @intCast((lparam >> 16) & 0xFFFF);
                 a.updateViewport(@intCast(width), @intCast(height));
-                if (a.surface) |s| {
+                // Notify ALL tabs of new size
+                const term_height = height - @as(u32, @intCast(a.tab_bar_height));
+                for (a.tabs.items) |s| {
                     s.core_surface.sizeCallback(.{
                         .width = width,
-                        .height = height,
+                        .height = term_height,
                     }) catch |err| {
                         log.warn("sizeCallback failed: {}", .{err});
                     };
@@ -742,7 +755,8 @@ fn wndProc(hwnd: HWND, msg_type: u32, wparam: WPARAM, lparam: LPARAM) callconv(.
         },
         WM_SETFOCUS => {
             if (app) |a| {
-                if (a.surface) |s| {
+                a.window_focused = true;
+                if (a.getActiveSurface()) |s| {
                     s.core_surface.focusCallback(true) catch |err| {
                         log.warn("focusCallback failed: {}", .{err});
                     };
@@ -752,7 +766,8 @@ fn wndProc(hwnd: HWND, msg_type: u32, wparam: WPARAM, lparam: LPARAM) callconv(.
         },
         WM_KILLFOCUS => {
             if (app) |a| {
-                if (a.surface) |s| {
+                a.window_focused = false;
+                if (a.getActiveSurface()) |s| {
                     s.core_surface.focusCallback(false) catch |err| {
                         log.warn("focusCallback failed: {}", .{err});
                     };
@@ -782,14 +797,42 @@ fn wndProc(hwnd: HWND, msg_type: u32, wparam: WPARAM, lparam: LPARAM) callconv(.
             return 0;
         },
         // ── Mouse messages ──────────────────────────────
-        WM_LBUTTONDOWN, WM_LBUTTONUP, WM_LBUTTONDBLCLK, WM_MBUTTONDOWN, WM_MBUTTONUP => {
+        WM_LBUTTONDOWN => {
             if (app) |a| {
-                if (a.surface) |s| {
+                const pos = mousePosFromLParam(lparam);
+                // Check if click is in the tab bar
+                if (pos.y < @as(f32, @floatFromInt(a.tab_bar_height))) {
+                    // Tab bar click: switch to clicked tab
+                    if (a.tabs.items.len > 1) {
+                        const tab_w = @as(f32, @floatFromInt(a.viewport_width)) / @as(f32, @floatFromInt(a.tabs.items.len));
+                        const clamped_w = @min(tab_w, 200.0);
+                        const idx: usize = @intFromFloat(pos.x / clamped_w);
+                        if (idx < a.tabs.items.len) a.switchToTab(idx);
+                    }
+                    return 0;
+                }
+                // Terminal area: offset Y and forward
+                const term_pos = apprt.CursorPos{ .x = pos.x, .y = pos.y - @as(f32, @floatFromInt(a.tab_bar_height)) };
+                if (a.getActiveSurface()) |s| {
+                    const mods = getMods();
+                    s.core_surface.cursorPosCallback(term_pos, mods) catch {};
+                    _ = s.core_surface.mouseButtonCallback(.press, .left, mods) catch |err| {
+                        log.warn("mouseButtonCallback failed: {}", .{err});
+                    };
+                }
+            }
+            return 0;
+        },
+        WM_LBUTTONUP, WM_LBUTTONDBLCLK, WM_MBUTTONDOWN, WM_MBUTTONUP => {
+            if (app) |a| {
+                if (a.getActiveSurface()) |s| {
+                    var pos = mousePosFromLParam(lparam);
+                    pos.y -= @as(f32, @floatFromInt(a.tab_bar_height));
+                    if (pos.y < 0) return 0;
                     const button = mouseButtonFromMsg(msg_type);
                     const action = mouseActionFromMsg(msg_type);
                     const mods = getMods();
-                    // Update cursor position first so the core knows where the click is
-                    s.core_surface.cursorPosCallback(mousePosFromLParam(lparam), mods) catch {};
+                    s.core_surface.cursorPosCallback(pos, mods) catch {};
                     _ = s.core_surface.mouseButtonCallback(action, button, mods) catch |err| {
                         log.warn("mouseButtonCallback failed: {}", .{err});
                     };
@@ -799,9 +842,12 @@ fn wndProc(hwnd: HWND, msg_type: u32, wparam: WPARAM, lparam: LPARAM) callconv(.
         },
         WM_RBUTTONUP => {
             if (app) |a| {
-                if (a.surface) |s| {
+                if (a.getActiveSurface()) |s| {
+                    var pos = mousePosFromLParam(lparam);
+                    pos.y -= @as(f32, @floatFromInt(a.tab_bar_height));
+                    if (pos.y < 0) return 0;
                     const mods = getMods();
-                    s.core_surface.cursorPosCallback(mousePosFromLParam(lparam), mods) catch {};
+                    s.core_surface.cursorPosCallback(pos, mods) catch {};
                     _ = s.core_surface.mouseButtonCallback(.release, .right, mods) catch |err| {
                         log.warn("mouseButtonCallback failed: {}", .{err});
                     };
@@ -811,10 +857,13 @@ fn wndProc(hwnd: HWND, msg_type: u32, wparam: WPARAM, lparam: LPARAM) callconv(.
         },
         WM_RBUTTONDOWN, WM_RBUTTONDBLCLK => {
             if (app) |a| {
-                if (a.surface) |s| {
+                if (a.getActiveSurface()) |s| {
+                    var pos = mousePosFromLParam(lparam);
+                    pos.y -= @as(f32, @floatFromInt(a.tab_bar_height));
+                    if (pos.y < 0) return 0;
                     const action = mouseActionFromMsg(msg_type);
                     const mods = getMods();
-                    s.core_surface.cursorPosCallback(mousePosFromLParam(lparam), mods) catch {};
+                    s.core_surface.cursorPosCallback(pos, mods) catch {};
                     _ = s.core_surface.mouseButtonCallback(action, .right, mods) catch |err| {
                         log.warn("mouseButtonCallback failed: {}", .{err});
                     };
@@ -824,12 +873,12 @@ fn wndProc(hwnd: HWND, msg_type: u32, wparam: WPARAM, lparam: LPARAM) callconv(.
         },
         WM_MOUSEMOVE => {
             if (app) |a| {
-                if (a.surface) |s| {
+                if (a.getActiveSurface()) |s| {
+                    var pos = mousePosFromLParam(lparam);
+                    pos.y -= @as(f32, @floatFromInt(a.tab_bar_height));
+                    if (pos.y < 0) return 0;
                     const mods = getMods();
-                    s.core_surface.cursorPosCallback(
-                        mousePosFromLParam(lparam),
-                        mods,
-                    ) catch |err| {
+                    s.core_surface.cursorPosCallback(pos, mods) catch |err| {
                         log.warn("cursorPosCallback failed: {}", .{err});
                     };
                 }
@@ -838,15 +887,15 @@ fn wndProc(hwnd: HWND, msg_type: u32, wparam: WPARAM, lparam: LPARAM) callconv(.
         },
         WM_MOUSEWHEEL, WM_MOUSEHWHEEL => {
             if (app) |a| {
-                if (a.surface) |s| {
+                if (a.getActiveSurface()) |s| {
                     const delta: i16 = @intCast((wparam >> 16) & 0xFFFF);
                     const scroll_amount: f32 = @floatFromInt(delta);
-                    const lines: f32 = scroll_amount / 120.0; // WHEEL_DELTA = 120
+                    const lines: f32 = scroll_amount / 120.0;
                     const mods = getMods();
-                    const pos = mousePosFromLParam(lparam);
+                    var pos = mousePosFromLParam(lparam);
+                    pos.y -= @as(f32, @floatFromInt(a.tab_bar_height));
                     const button: input.MouseButton = if (msg_type == WM_MOUSEWHEEL) .four else .five;
 
-                    // Update cursor position before scroll
                     s.core_surface.cursorPosCallback(pos, mods) catch {};
 
                     const abs_lines = @abs(lines);
@@ -866,7 +915,7 @@ fn wndProc(hwnd: HWND, msg_type: u32, wparam: WPARAM, lparam: LPARAM) callconv(.
         },
         WM_IME_STARTCOMPOSITION => {
             if (app) |a| {
-                if (a.surface) |s| {
+                if (a.getActiveSurface()) |s| {
                     setImePosition(s);
                     s.core_surface.preeditCallback(null) catch {};
                 }
@@ -875,7 +924,7 @@ fn wndProc(hwnd: HWND, msg_type: u32, wparam: WPARAM, lparam: LPARAM) callconv(.
         },
         WM_IME_COMPOSITION => {
             if (app) |a| {
-                if (a.surface) |s| {
+                if (a.getActiveSurface()) |s| {
                     const himc = ImmGetContext(hwnd);
                     defer {
                         if (himc) |h| _ = ImmReleaseContext(hwnd, h);
@@ -917,7 +966,7 @@ fn wndProc(hwnd: HWND, msg_type: u32, wparam: WPARAM, lparam: LPARAM) callconv(.
         },
         WM_IME_ENDCOMPOSITION => {
             if (app) |a| {
-                if (a.surface) |s| {
+                if (a.getActiveSurface()) |s| {
                     s.core_surface.preeditCallback(null) catch {};
                 }
             }
@@ -940,8 +989,25 @@ pub const App = struct {
     wgl_swap_interval: ?*const fn (c_int) callconv(.winapi) BOOL,
     viewport_width: c_int,
     viewport_height: c_int,
-    surface: ?*Surface,
+    /// Tab bar height in pixels (scaled by DPI), 0 when single tab
+    tab_bar_height: c_int,
+    /// All tabs (owned Surfaces). Index matches display order.
+    tabs: std.ArrayListUnmanaged(*Surface),
+    /// Index into tabs for the visible/active tab
+    active_tab: usize,
+    /// Cached tab titles, one per tab slot (fixed capacity)
+    tab_titles: std.ArrayListUnmanaged([:0]const u8),
+    window_focused: bool,
     config: ?configpkg.Config,
+
+    fn getActiveSurface(self: *App) ?*Surface {
+        if (self.tabs.items.len == 0) return null;
+        return self.tabs.items[self.active_tab];
+    }
+
+    fn computeTabBarHeight(dpi: u32) c_int {
+        return @intFromFloat(@as(f32, @floatFromInt(dpi)) * (30.0 / 96.0));
+    }
 
     pub fn init(
         self: *App,
@@ -964,7 +1030,11 @@ pub const App = struct {
             .wgl_swap_interval = null,
             .viewport_width = 0,
             .viewport_height = 0,
-            .surface = null,
+            .tab_bar_height = 0,
+            .tabs = .empty,
+            .active_tab = 0,
+            .tab_titles = .empty,
+            .window_focused = false,
             .config = null,
         };
 
@@ -1016,15 +1086,16 @@ pub const App = struct {
         };
         errdefer config.deinit();
 
-        // Create and initialize the terminal surface
-        try self.initSurface(&config);
+        // Create initial tab
+        self.tab_bar_height = App.computeTabBarHeight(self.dpi);
+        try self.createTab(&config);
         self.config = config;
 
         _ = ShowWindow(hwnd, SW_SHOW);
         log.info("window created, DPI={}", .{self.dpi});
     }
 
-    fn initSurface(self: *App, config: *const configpkg.Config) !void {
+    fn createTab(self: *App, config: *const configpkg.Config) !void {
         const alloc = self.core_app.alloc;
 
         const surface = try alloc.create(Surface);
@@ -1048,8 +1119,113 @@ pub const App = struct {
             return err;
         };
 
-        self.surface = surface;
-        log.info("terminal surface initialized", .{});
+        // Allocate title placeholder
+        const title = try alloc.dupeZ(u8, "Ghostty");
+        errdefer alloc.free(title);
+
+        try self.tabs.append(alloc, surface);
+        try self.tab_titles.append(alloc, title);
+        self.active_tab = self.tabs.items.len - 1;
+
+        // Notify surface of current viewport size
+        if (self.viewport_width > 0 and self.viewport_height > self.tab_bar_height) {
+            const term_height: u32 = @intCast(self.viewport_height - self.tab_bar_height);
+            surface.core_surface.sizeCallback(.{
+                .width = @intCast(self.viewport_width),
+                .height = term_height,
+            }) catch {};
+        }
+        if (self.window_focused) {
+            surface.core_surface.focusCallback(true) catch {};
+        }
+
+        log.info("tab created, total={d}", .{self.tabs.items.len});
+    }
+
+    fn closeTab(self: *App, index: usize) void {
+        if (index >= self.tabs.items.len) return;
+        const alloc = self.core_app.alloc;
+        const surface = self.tabs.items[index];
+
+        surface.core_surface.deinit();
+        self.core_app.deleteSurface(surface);
+        alloc.destroy(surface);
+        alloc.free(self.tab_titles.items[index]);
+
+        _ = self.tabs.orderedRemove(index);
+        _ = self.tab_titles.orderedRemove(index);
+
+        // Rebalance active_tab
+        if (self.tabs.items.len == 0) {
+            self.active_tab = 0;
+            if (self.hwnd) |hwnd| _ = DestroyWindow(hwnd);
+            return;
+        }
+        if (index <= self.active_tab and self.active_tab > 0) {
+            self.active_tab -= 1;
+        }
+        if (self.active_tab >= self.tabs.items.len) {
+            self.active_tab = self.tabs.items.len - 1;
+        }
+
+        // Focus the new active tab
+        if (self.window_focused) {
+            if (self.getActiveSurface()) |s| {
+                s.core_surface.focusCallback(true) catch {};
+            }
+        }
+        log.info("tab closed, remaining={d}", .{self.tabs.items.len});
+    }
+
+    fn switchTab(self: *App, delta: isize) void {
+        if (self.tabs.items.len < 2) return;
+        const old_idx = self.active_tab;
+        const new_idx = @as(isize, @intCast(self.active_tab)) + delta;
+        const len: isize = @intCast(self.tabs.items.len);
+        self.active_tab = @intCast(@mod(new_idx, len));
+        if (self.active_tab == old_idx) return;
+        self.activateTab(old_idx, self.active_tab);
+    }
+
+    fn switchToTab(self: *App, index: usize) void {
+        if (index >= self.tabs.items.len or index == self.active_tab) return;
+        const old_idx = self.active_tab;
+        self.active_tab = index;
+        self.activateTab(old_idx, self.active_tab);
+    }
+
+    fn activateTab(self: *App, old_idx: usize, new_idx: usize) void {
+        // Defocus old tab
+        if (old_idx < self.tabs.items.len) {
+            self.tabs.items[old_idx].core_surface.focusCallback(false) catch {};
+        }
+        // Focus new tab and update size
+        if (new_idx < self.tabs.items.len) {
+            const s = self.tabs.items[new_idx];
+            if (self.window_focused) {
+                s.core_surface.focusCallback(true) catch {};
+            }
+            if (self.viewport_width > 0 and self.viewport_height > self.tab_bar_height) {
+                const term_height: u32 = @intCast(self.viewport_height - self.tab_bar_height);
+                s.core_surface.sizeCallback(.{
+                    .width = @intCast(self.viewport_width),
+                    .height = term_height,
+                }) catch {};
+            }
+            // Update window title
+            if (self.hwnd) |hwnd| {
+                const title = self.tab_titles.items[new_idx];
+                var buf: [256]u16 = undefined;
+                const utf16_len = std.unicode.utf8ToUtf16Le(&buf, title) catch 0;
+                if (utf16_len < buf.len) {
+                    buf[utf16_len] = 0;
+                    _ = SetWindowTextW(hwnd, buf[0..utf16_len :0]);
+                }
+            }
+        }
+        // Re-render
+        if (self.hwnd) |hwnd| _ = InvalidateRect(hwnd, null, 0);
+        log.info("tab switched to={d}", .{self.active_tab});
     }
 
     fn initOpenGL(self: *App) !void {
@@ -1139,26 +1315,71 @@ pub const App = struct {
         if (self.hglrc == null) return;
         self.viewport_width = width;
         self.viewport_height = height;
-        gl.viewport(0, 0, width, height) catch {};
+        // Terminal area is below the tab bar
+        const term_height = height - self.tab_bar_height;
+        if (term_height > 0) {
+            gl.viewport(0, self.tab_bar_height, width, term_height) catch {};
+        }
+    }
+
+    fn renderTabBar(self: *App) void {
+        if (self.tabs.items.len <= 1) return;
+        const hdc = self.hdc orelse return;
+        const tab_h = self.tab_bar_height;
+        const width = self.viewport_width;
+
+        // Use GDI to draw tab bar on the HDC before SwapBuffers
+        // Background rect
+        const bg_brush = win32CreateSolidBrush(0x242428);
+        var bg_rect: RECT = .{ .left = 0, .top = 0, .right = width, .bottom = tab_h };
+        _ = FillRect(hdc, &bg_rect, bg_brush);
+        _ = DeleteObject(bg_brush);
+
+        // Tab buttons
+        const tab_count: c_int = @intCast(self.tabs.items.len);
+        const tab_w: c_int = @divTrunc(width, tab_count);
+        const clamped_w: c_int = @min(tab_w, 200);
+        const padding: c_int = 2;
+
+        for (self.tabs.items, 0..) |_, i| {
+            const x: c_int = @as(c_int, @intCast(i)) * clamped_w + padding;
+            const w: c_int = @max(1, clamped_w - 2 * padding);
+            const is_active = (i == self.active_tab);
+            const color: u32 = if (is_active) @as(u32, 0x333340) else @as(u32, 0x26262C);
+            const brush = win32CreateSolidBrush(color);
+            var rect: RECT = .{
+                .left = x,
+                .top = padding,
+                .right = x + w,
+                .bottom = @max(1, tab_h - 2 * padding),
+            };
+            _ = FillRect(hdc, &rect, brush);
+            _ = DeleteObject(brush);
+        }
     }
 
     fn renderSurface(self: *App) void {
         const hdc = self.hdc orelse return;
         if (self.hglrc == null) return;
 
-        if (self.surface) |s| {
+        if (self.getActiveSurface()) |s| {
             s.core_surface.renderer.drawFrame(true) catch |err| {
                 log.warn("drawFrame failed: {}", .{err});
             };
         } else {
+            gl.viewport(0, 0, self.viewport_width, self.viewport_height) catch {};
             gl.clearColor(0.1, 0.1, 0.12, 1.0);
             gl.clear(gl.c.GL_COLOR_BUFFER_BIT);
         }
+
+        // Draw tab bar on top
+        self.renderTabBar();
+
         _ = SwapBuffers(hdc);
     }
 
     fn handleKeyInput(self: *App, wparam: WPARAM, lparam: LPARAM, is_release: bool) bool {
-        const s = self.surface orelse return false;
+        const s = self.getActiveSurface() orelse return false;
 
         const vk: u16 = @intCast(wparam & 0xFFFF);
         const scancode: u16 = @intCast((lparam >> 16) & 0xFF);
@@ -1167,6 +1388,22 @@ pub const App = struct {
 
         const key = vkToKey(vk, extended);
         const mods = getMods();
+
+        // Tab shortcuts (press only)
+        if (!is_release and mods.ctrl and !mods.alt and !mods.super) {
+            if (mods.shift) {
+                if (key == .key_t) { if (self.config) |*c| self.createTab(c) catch {}; return true; }
+                if (key == .key_w) { self.closeTab(self.active_tab); return true; }
+            }
+            if (key == .tab) {
+                if (mods.shift) self.switchTab(-1) else self.switchTab(1);
+                return true;
+            }
+            // Ctrl+1..9 to jump to tab
+            inline for (.{ .digit_1, .digit_2, .digit_3, .digit_4, .digit_5, .digit_6, .digit_7, .digit_8, .digit_9 }, 0..) |digit_key, idx| {
+                if (key == digit_key) { self.switchToTab(idx); return true; }
+            }
+        }
 
         if (is_release) {
             const effect = s.core_surface.keyCallback(.{
@@ -1230,11 +1467,14 @@ pub const App = struct {
     }
 
     pub fn terminate(self: *App) void {
-        if (self.surface) |s| {
+        const alloc = self.core_app.alloc;
+        for (self.tabs.items) |s| {
             s.core_surface.deinit();
-            self.core_app.alloc.destroy(s);
-            self.surface = null;
+            alloc.destroy(s);
         }
+        for (self.tab_titles.items) |title| alloc.free(title);
+        self.tabs.deinit(alloc);
+        self.tab_titles.deinit(alloc);
         if (self.config) |*c| {
             c.deinit();
             self.config = null;
@@ -1275,14 +1515,26 @@ pub const App = struct {
             .set_title => {
                 switch (target) {
                     .app => {},
-                    .surface => |_| {
+                    .surface => |surface_ptr| {
                         if (value.title.len > 0) {
-                            if (self.hwnd) |hwnd| {
-                                var buf: [256]u16 = undefined;
-                                const utf16_len = std.unicode.utf8ToUtf16Le(&buf, value.title) catch 0;
-                                if (utf16_len < buf.len) {
-                                    buf[utf16_len] = 0;
-                                    _ = SetWindowTextW(hwnd, buf[0..utf16_len :0]);
+                            // Cache title for the tab
+                            for (self.tabs.items, 0..) |tab_surface, i| {
+                                if (@intFromPtr(tab_surface) == @intFromPtr(surface_ptr)) {
+                                    const old_title = self.tab_titles.items[i];
+                                    self.tab_titles.items[i] = self.core_app.alloc.dupeZ(u8, value.title) catch value.title;
+                                    if (old_title.len > 0) self.core_app.alloc.free(old_title);
+                                    // Update window title if this is the active tab
+                                    if (i == self.active_tab) {
+                                        if (self.hwnd) |hwnd| {
+                                            var buf: [256]u16 = undefined;
+                                            const utf16_len = std.unicode.utf8ToUtf16Le(&buf, value.title) catch 0;
+                                            if (utf16_len < buf.len) {
+                                                buf[utf16_len] = 0;
+                                                _ = SetWindowTextW(hwnd, buf[0..utf16_len :0]);
+                                            }
+                                        }
+                                    }
+                                    break;
                                 }
                             }
                         }
@@ -1295,7 +1547,17 @@ pub const App = struct {
                 return true;
             },
             .close_tab => {
-                if (self.hwnd) |hwnd| _ = DestroyWindow(hwnd);
+                switch (target) {
+                    .app => {},
+                    .surface => |surface_ptr| {
+                        for (self.tabs.items, 0..) |tab_surface, i| {
+                            if (@intFromPtr(tab_surface) == @intFromPtr(surface_ptr)) {
+                                self.closeTab(i);
+                                break;
+                            }
+                        }
+                    },
+                }
                 return true;
             },
             .quit_timer => {
@@ -1308,7 +1570,19 @@ pub const App = struct {
                 return true;
             },
             .show_child_exited => {
-                if (self.hwnd) |hwnd| _ = DestroyWindow(hwnd);
+                switch (target) {
+                    .app => {
+                        if (self.hwnd) |hwnd| _ = DestroyWindow(hwnd);
+                    },
+                    .surface => |surface_ptr| {
+                        for (self.tabs.items, 0..) |tab_surface, i| {
+                            if (@intFromPtr(tab_surface) == @intFromPtr(surface_ptr)) {
+                                self.closeTab(i);
+                                break;
+                            }
+                        }
+                    },
+                }
                 return true;
             },
             .size_limit,
