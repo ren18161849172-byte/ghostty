@@ -1408,19 +1408,38 @@ pub const App = struct {
         const hdc = self.hdc orelse return;
         if (self.hglrc == null) return;
 
-        // Draw GDI tab bar BEFORE OpenGL. GDI+GL mixing on CS_OWNDC
-        // works on most drivers when GDI is drawn first.
+        // Phase 1: Render terminal with OpenGL into the back buffer.
+        // GL viewport covers only the terminal area (below the tab bar).
+        const term_h = self.viewport_height - self.tab_bar_height;
+        if (self.getActiveSurface()) |s| {
+            if (term_h > 0) {
+                gl.viewport(0, 0, self.viewport_width, term_h) catch {};
+            }
+            s.core_surface.renderer.drawFrame(true) catch |err| {
+                log.warn("drawFrame failed: {}", .{err});
+            };
+        } else {
+            gl.viewport(0, 0, self.viewport_width, self.viewport_height) catch {};
+            gl.clearColor(0.1, 0.1, 0.12, 1.0);
+            gl.clear(gl.c.GL_COLOR_BUFFER_BIT);
+        }
+
+        // Phase 2: Swap — terminal is now in the front buffer.
+        _ = SwapBuffers(hdc);
+
+        // Phase 3: Draw GDI tab bar directly onto the front buffer.
+        // On the next frame, SwapBuffers moves this front buffer to back,
+        // but GL only blits to the bottom (terminal) area, preserving the
+        // tab bar at the top of the back buffer.
         if (self.tabs.items.len > 1) {
             const tab_h = self.tab_bar_height;
             const w = self.viewport_width;
 
-            // Tab bar background
             const bg_brush = win32CreateSolidBrush(0x242428);
             var bg_rect: RECT = .{ .left = 0, .top = 0, .right = w, .bottom = tab_h };
             _ = FillRect(hdc, &bg_rect, bg_brush);
             _ = DeleteObject(bg_brush);
 
-            // Tab buttons
             const tab_count: c_int = @intCast(self.tabs.items.len);
             const tab_w: c_int = @divTrunc(w, tab_count);
             const clamped_w: c_int = @min(tab_w, 200);
@@ -1438,24 +1457,6 @@ pub const App = struct {
                 _ = DeleteObject(brush);
             }
         }
-
-        // Now render terminal. Use drawFrame(false) to skip internal glClear,
-        // which would wipe out the GDI tab bar (glClear ignores viewport).
-        const term_h = self.viewport_height - self.tab_bar_height;
-        if (self.getActiveSurface()) |s| {
-            if (term_h > 0) {
-                gl.viewport(0, 0, self.viewport_width, term_h) catch {};
-            }
-            s.core_surface.renderer.drawFrame(true) catch |err| {
-                log.warn("drawFrame failed: {}", .{err});
-            };
-        } else {
-            gl.viewport(0, 0, self.viewport_width, self.viewport_height) catch {};
-            gl.clearColor(0.1, 0.1, 0.12, 1.0);
-            gl.clear(gl.c.GL_COLOR_BUFFER_BIT);
-        }
-
-        _ = SwapBuffers(hdc);
     }
 
     fn handleKeyInput(self: *App, wparam: WPARAM, lparam: LPARAM, is_release: bool) bool {
