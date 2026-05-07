@@ -536,6 +536,38 @@ fn mousePosFromLParam(lparam: LPARAM) apprt.CursorPos {
     return .{ .x = @floatFromInt(x), .y = @floatFromInt(y) };
 }
 
+// HIWORD(wparam) of WM_MOUSEWHEEL/HWHEEL is a SIGNED i16 wheel delta in
+// multiples of WHEEL_DELTA (120). We must @bitCast through u16 to preserve
+// the sign of negative values — a naive @intCast on the unsigned u32 LO 16
+// bits panics for negative deltas (e.g. 0xFF88 → 65416 doesn't fit in i16).
+// Returns wheel "ticks": +1.0 per notch up/right, -1.0 per notch down/left.
+fn wheelTicks(wparam: WPARAM) f64 {
+    const hi: u16 = @truncate((wparam >> 16) & 0xFFFF);
+    const delta: i16 = @bitCast(hi);
+    return @as(f64, @floatFromInt(delta)) / 120.0;
+}
+
+test "wheelTicks: forward scroll one notch" {
+    // wparam HIWORD = 120 → +1.0 ticks
+    try std.testing.expectEqual(@as(f64, 1.0), wheelTicks(120 << 16));
+}
+
+test "wheelTicks: backward scroll one notch (signed handling)" {
+    // wparam HIWORD = 0xFF88 (= -120 as i16) → -1.0 ticks.
+    // Pre-fix code panicked here because @intCast(i16, 65416) is out of range.
+    try std.testing.expectEqual(@as(f64, -1.0), wheelTicks(0xFF88 << 16));
+}
+
+test "wheelTicks: zero delta" {
+    try std.testing.expectEqual(@as(f64, 0.0), wheelTicks(0));
+}
+
+test "wheelTicks: fast scroll multiple notches" {
+    try std.testing.expectEqual(@as(f64, 4.0), wheelTicks(480 << 16));
+    // -480 as i16 = 0xFE20
+    try std.testing.expectEqual(@as(f64, -4.0), wheelTicks(0xFE20 << 16));
+}
+
 fn mouseButtonFromMsg(msg: u32) input.MouseButton {
     return switch (msg) {
         WM_LBUTTONDOWN, WM_LBUTTONUP, WM_LBUTTONDBLCLK => .left,
@@ -903,14 +935,12 @@ fn wndProc(hwnd: HWND, msg_type: u32, wparam: WPARAM, lparam: LPARAM) callconv(.
         WM_MOUSEWHEEL, WM_MOUSEHWHEEL => {
             if (app) |a| {
                 if (a.getActiveSurface()) |s| {
-                    var pos = mousePosFromLParam(lparam);
-                    pos.y -= @as(f32, @floatFromInt(a.tab_bar_height));
-                    if (pos.y < 0) return 0;
-                    const mods = getMods();
-                    const button: input.MouseButton = if (msg_type == WM_MOUSEWHEEL) .four else .five;
-                    s.core_surface.cursorPosCallback(pos, mods) catch {};
-                    _ = s.core_surface.mouseButtonCallback(.press, button, mods) catch {};
-                    _ = s.core_surface.mouseButtonCallback(.release, button, mods) catch {};
+                    const ticks = wheelTicks(wparam);
+                    const xoff: f64 = if (msg_type == WM_MOUSEHWHEEL) ticks else 0.0;
+                    const yoff: f64 = if (msg_type == WM_MOUSEWHEEL) ticks else 0.0;
+                    s.core_surface.scrollCallback(xoff, yoff, .{}) catch |err| {
+                        log.warn("scrollCallback failed: {}", .{err});
+                    };
                 }
             }
             return 0;
