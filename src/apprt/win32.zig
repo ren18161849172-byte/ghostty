@@ -81,6 +81,20 @@ const PAINTSTRUCT = extern struct {
     rgbReserved: [32]u8,
 };
 
+// ── IME structs ────────────────────────────────────────
+const HIMC = *opaque {};
+const COMPOSITIONFORM = extern struct {
+    dwStyle: u32,
+    ptCurrentPos: POINT,
+    rcArea: RECT,
+};
+const CANDIDATEFORM = extern struct {
+    dwIndex: u32,
+    dwStyle: u32,
+    ptCurrentPos: POINT,
+    rcArea: RECT,
+};
+
 // ── WGL / OpenGL types ────────────────────────────────
 const HGLRC = *opaque {};
 
@@ -143,6 +157,19 @@ const WM_MOUSEHWHEEL: u32 = 0x020E;
 const WM_KEYFIRST: u32 = 0x0100;
 const WM_KEYLAST: u32 = 0x0109;
 const SIZE_MINIMIZED: u32 = 1;
+
+// ── IME message constants ────────────────────────────
+const WM_IME_SETCONTEXT: u32 = 0x0281;
+const WM_IME_STARTCOMPOSITION: u32 = 0x010D;
+const WM_IME_ENDCOMPOSITION: u32 = 0x010E;
+const WM_IME_COMPOSITION: u32 = 0x010F;
+
+// ── IME composition flags ──────────────────────────────
+const GCS_RESULTSTR: u32 = 0x0800;
+const GCS_COMPSTR: u32 = 0x0008;
+const CFS_POINT: u32 = 0x0002;
+const CFS_FORCE_POSITION: u32 = 0x0020;
+const CFS_CANDIDATEPOS: u32 = 0x0040;
 
 // ── Clipboard format constants ────────────────────────
 const CF_UNICODETEXT: u32 = 13;
@@ -284,6 +311,14 @@ extern "opengl32" fn wglCreateContext(HDC) callconv(.winapi) ?HGLRC;
 extern "opengl32" fn wglMakeCurrent(?HDC, ?HGLRC) callconv(.winapi) BOOL;
 extern "opengl32" fn wglDeleteContext(HGLRC) callconv(.winapi) BOOL;
 extern "opengl32" fn wglGetProcAddress([*:0]const u8) callconv(.winapi) ?*const fn () callconv(.c) void;
+
+// ── IMM32 extern functions ─────────────────────────────
+extern "imm32" fn ImmGetContext(?HWND) callconv(.winapi) ?HIMC;
+extern "imm32" fn ImmReleaseContext(?HWND, ?HIMC) callconv(.winapi) BOOL;
+extern "imm32" fn ImmGetCompositionStringW(?HIMC, u32, ?*anyopaque, u32) callconv(.winapi) i32;
+extern "imm32" fn ImmSetCompositionWindow(?HIMC, *const COMPOSITIONFORM) callconv(.winapi) BOOL;
+extern "imm32" fn ImmSetCandidateWindow(?HIMC, *const CANDIDATEFORM) callconv(.winapi) BOOL;
+extern "imm32" fn ImmGetDefaultIMEWnd(?HWND) callconv(.winapi) ?HWND;
 
 // ── Keyboard helpers ──────────────────────────────────
 
@@ -581,6 +616,60 @@ fn writeClipboardUtf8(text: []const u8) !void {
     }
 }
 
+// ── IME helpers ────────────────────────────────────────
+
+fn readCompositionString(himc: ?HIMC, flags: u32, alloc: Allocator) ![]u8 {
+    const len = ImmGetCompositionStringW(himc, flags, null, 0);
+    if (len <= 0) return &[_]u8{};
+
+    // len includes null terminator for some flags
+    const byte_len: u32 = @intCast(len);
+    const buf_len = if (len > 0) @as(usize, @intCast(len)) else 0;
+
+    const utf16_buf = try alloc.alloc(u8, buf_len);
+    defer alloc.free(utf16_buf);
+
+    _ = ImmGetCompositionStringW(himc, flags, utf16_buf.ptr, byte_len);
+
+    const utf16_slice = @as([*]const u16, @ptrCast(@alignCast(utf16_buf.ptr)))[0 .. buf_len / 2];
+
+    var result = try std.ArrayList(u8).initCapacity(alloc, utf16_slice.len * 3);
+    errdefer result.deinit(alloc);
+    var it = std.unicode.Utf16LeIterator.init(utf16_slice);
+    while (it.nextCodepoint() catch null) |cp| {
+        var buf: [4]u8 = undefined;
+        const cp_len = try std.unicode.utf8Encode(cp, &buf);
+        try result.appendSlice(alloc, buf[0..cp_len]);
+    }
+    return try result.toOwnedSlice(alloc);
+}
+
+fn setImePosition(surface: *Surface) void {
+    const hwnd = surface.app.hwnd orelse return;
+    const himc = ImmGetContext(hwnd) orelse return;
+    defer _ = ImmReleaseContext(hwnd, himc);
+
+    const ime_pos = surface.core_surface.imePoint();
+    const x: i32 = @intFromFloat(ime_pos.x);
+    const y: i32 = @intFromFloat(ime_pos.y);
+
+    var cf: COMPOSITIONFORM = .{
+        .dwStyle = CFS_POINT | CFS_FORCE_POSITION,
+        .ptCurrentPos = .{ .x = x, .y = y },
+        .rcArea = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 },
+    };
+    _ = ImmSetCompositionWindow(himc, &cf);
+
+    // Position candidate window near cursor too
+    var cand: CANDIDATEFORM = .{
+        .dwIndex = 0,
+        .dwStyle = CFS_CANDIDATEPOS,
+        .ptCurrentPos = .{ .x = x, .y = y + 20 },
+        .rcArea = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 },
+    };
+    _ = ImmSetCandidateWindow(himc, &cand);
+}
+
 // ── Window procedure ───────────────────────────────────
 fn wndProc(hwnd: HWND, msg_type: u32, wparam: WPARAM, lparam: LPARAM) callconv(.winapi) LRESULT {
     const ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA);
@@ -770,6 +859,69 @@ fn wndProc(hwnd: HWND, msg_type: u32, wparam: WPARAM, lparam: LPARAM) callconv(.
                 }
             }
             return 0;
+        },
+        WM_IME_SETCONTEXT => {
+            // Let DefWindowProc handle default IME activation
+            return DefWindowProcW(hwnd, msg_type, wparam, lparam);
+        },
+        WM_IME_STARTCOMPOSITION => {
+            if (app) |a| {
+                if (a.surface) |s| {
+                    setImePosition(s);
+                    s.core_surface.preeditCallback(null) catch {};
+                }
+            }
+            return DefWindowProcW(hwnd, msg_type, wparam, lparam);
+        },
+        WM_IME_COMPOSITION => {
+            if (app) |a| {
+                if (a.surface) |s| {
+                    const himc = ImmGetContext(hwnd);
+                    defer {
+                        if (himc) |h| _ = ImmReleaseContext(hwnd, h);
+                    }
+
+                    // Read result string (final committed text)
+                    if ((wparam & GCS_RESULTSTR) != 0) {
+                        const result_text = readCompositionString(himc, GCS_RESULTSTR, a.core_app.alloc) catch null;
+                        if (result_text) |text| {
+                            defer a.core_app.alloc.free(text);
+                            if (text.len > 0) {
+                                // Send committed text as key events with utf8 data
+                                _ = s.core_surface.keyCallback(.{
+                                    .action = .press,
+                                    .key = .unidentified,
+                                    .mods = .{},
+                                    .utf8 = text,
+                                }) catch {};
+                            }
+                        }
+                    }
+
+                    // Read composition string (in-progress preedit)
+                    if ((wparam & GCS_COMPSTR) != 0) {
+                        const comp_text = readCompositionString(himc, GCS_COMPSTR, a.core_app.alloc) catch null;
+                        if (comp_text) |text| {
+                            defer a.core_app.alloc.free(text);
+                            s.core_surface.preeditCallback(text) catch {};
+                        }
+                    }
+
+                    // Update IME window position
+                    if ((wparam & (GCS_COMPSTR | GCS_RESULTSTR)) != 0) {
+                        setImePosition(s);
+                    }
+                }
+            }
+            return 0;
+        },
+        WM_IME_ENDCOMPOSITION => {
+            if (app) |a| {
+                if (a.surface) |s| {
+                    s.core_surface.preeditCallback(null) catch {};
+                }
+            }
+            return DefWindowProcW(hwnd, msg_type, wparam, lparam);
         },
         else => return DefWindowProcW(hwnd, msg_type, wparam, lparam),
     }
