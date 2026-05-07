@@ -23,7 +23,7 @@ pub const Options = struct {
 pub fn config(alloc: Allocator, opts: Options) ![]u8 {
     return try dir(alloc, opts, .{
         .env = "XDG_CONFIG_HOME",
-        .windows_env = "LOCALAPPDATA",
+        .windows_env = "APPDATA",
         .default_subdir = ".config",
     });
 }

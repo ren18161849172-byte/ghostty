@@ -3832,6 +3832,33 @@ pub fn deinit(self: *Config) void {
 ///   4. CLI flags
 ///   5. Recursively defined configuration files
 ///
+/// Detect the best available Windows shell by searching PATH.
+/// Fallback chain: pwsh.exe → powershell.exe → cmd.exe.
+fn detectWindowsShell(alloc: Allocator) ![:0]const u8 {
+    const shells = [_][]const u8{ "pwsh.exe", "powershell.exe" };
+
+    // Get PATH and search for each candidate
+    if (std.process.getEnvVarOwned(alloc, "PATH")) |path_value| {
+        defer alloc.free(path_value);
+        var it = std.mem.splitScalar(u8, path_value, ';');
+        while (it.next()) |dir| {
+            for (shells) |shell| {
+                const full_path = try std.fs.path.join(alloc, &.{ dir, shell });
+                defer alloc.free(full_path);
+                // Check if the file exists and is accessible
+                const file_check = std.fs.openFileAbsolute(full_path, .{}) catch continue;
+                file_check.close();
+                // Return only the executable name (not full path) for consistent
+                // shell behavior — Windows resolves via PATH
+                return try alloc.dupeZ(u8, shell);
+            }
+        }
+    } else |_| {}
+
+    // Always fall back to cmd.exe
+    return try alloc.dupeZ(u8, "cmd.exe");
+}
+
 pub fn load(alloc_gpa: Allocator) !Config {
     var result = try default(alloc_gpa);
     errdefer result.deinit();
@@ -4594,8 +4621,9 @@ pub fn finalize(self: *Config) !void {
             switch (builtin.os.tag) {
                 .windows => {
                     if (self.command == null) {
-                        log.warn("no default shell found, will default to using cmd", .{});
-                        self.command = .{ .shell = "cmd.exe" };
+                        const shell = try detectWindowsShell(alloc);
+                        log.info("detected Windows shell: {s}", .{shell});
+                        self.command = .{ .shell = shell };
                     }
 
                     if (wd == .home) {
