@@ -332,6 +332,7 @@ extern "imm32" fn ImmGetCompositionStringW(?HIMC, u32, ?*anyopaque, u32) callcon
 extern "imm32" fn ImmSetCompositionWindow(?HIMC, *const COMPOSITIONFORM) callconv(.winapi) BOOL;
 extern "imm32" fn ImmSetCandidateWindow(?HIMC, *const CANDIDATEFORM) callconv(.winapi) BOOL;
 extern "imm32" fn ImmGetDefaultIMEWnd(?HWND) callconv(.winapi) ?HWND;
+extern "imm32" fn ImmSetOpenStatus(?HIMC, BOOL) callconv(.winapi) BOOL;
 
 // ── Keyboard helpers ──────────────────────────────────
 
@@ -764,6 +765,12 @@ fn wndProc(hwnd: HWND, msg_type: u32, wparam: WPARAM, lparam: LPARAM) callconv(.
         WM_SETFOCUS => {
             if (app) |a| {
                 a.window_focused = true;
+                // Enable IME for this window
+                const himc = ImmGetContext(hwnd);
+                if (himc) |h| {
+                    _ = ImmSetOpenStatus(h, 1);
+                    _ = ImmReleaseContext(hwnd, h);
+                }
                 if (a.getActiveSurface()) |s| {
                     s.core_surface.focusCallback(true) catch |err| {
                         log.warn("focusCallback failed: {}", .{err});
@@ -902,6 +909,8 @@ fn wndProc(hwnd: HWND, msg_type: u32, wparam: WPARAM, lparam: LPARAM) callconv(.
                     const mods = getMods();
                     var pos = mousePosFromLParam(lparam);
                     pos.y -= @as(f32, @floatFromInt(a.tab_bar_height));
+                    // Skip scrolls outside terminal area
+                    if (pos.y < 0) return 0;
                     const button: input.MouseButton = if (msg_type == WM_MOUSEWHEEL) .four else .five;
 
                     s.core_surface.cursorPosCallback(pos, mods) catch {};
@@ -1137,6 +1146,14 @@ pub const App = struct {
         const title = try alloc.dupeZ(u8, "Ghostty");
         errdefer alloc.free(title);
 
+        // Defocus old active tab before switching
+        if (self.tabs.items.len > 0) {
+            const old_idx = self.active_tab;
+            if (old_idx < self.tabs.items.len) {
+                self.tabs.items[old_idx].core_surface.focusCallback(false) catch {};
+            }
+        }
+
         try self.tabs.append(alloc, surface);
         try self.tab_titles.append(alloc, title);
         self.active_tab = self.tabs.items.len - 1;
@@ -1360,56 +1377,54 @@ pub const App = struct {
         if (self.hglrc == null) return;
         self.viewport_width = width;
         self.viewport_height = height;
-        // OpenGL viewport origin is bottom-left. Use reduced height so
-        // the top tab_bar_height pixels remain free for the GDI tab bar.
-        // Screen layout: [GDI tab bar] top + [OpenGL terminal] below.
-        const term_height = height - self.tab_bar_height;
-        if (term_height > 0) {
-            gl.viewport(0, 0, width, term_height) catch {};
-        }
-    }
-
-    fn renderTabBar(self: *App) void {
-        if (self.tabs.items.len <= 1) return;
-        const hdc = self.hdc orelse return;
-        const tab_h = self.tab_bar_height;
-        const width = self.viewport_width;
-
-        // Use GDI to draw tab bar on the HDC before SwapBuffers
-        // Background rect
-        const bg_brush = win32CreateSolidBrush(0x242428);
-        var bg_rect: RECT = .{ .left = 0, .top = 0, .right = width, .bottom = tab_h };
-        _ = FillRect(hdc, &bg_rect, bg_brush);
-        _ = DeleteObject(bg_brush);
-
-        // Tab buttons
-        const tab_count: c_int = @intCast(self.tabs.items.len);
-        const tab_w: c_int = @divTrunc(width, tab_count);
-        const clamped_w: c_int = @min(tab_w, 200);
-        const padding: c_int = 2;
-
-        for (self.tabs.items, 0..) |_, i| {
-            const x: c_int = @as(c_int, @intCast(i)) * clamped_w + padding;
-            const w: c_int = @max(1, clamped_w - 2 * padding);
-            const is_active = (i == self.active_tab);
-            const color: u32 = if (is_active) @as(u32, 0x333340) else @as(u32, 0x26262C);
-            const brush = win32CreateSolidBrush(color);
-            var rect: RECT = .{
-                .left = x,
-                .top = padding,
-                .right = x + w,
-                .bottom = @max(1, tab_h - 2 * padding),
-            };
-            _ = FillRect(hdc, &rect, brush);
-            _ = DeleteObject(brush);
-        }
+        // OpenGL viewport: bottom-left origin. (0, 0, w, term_h) fills from
+        // screen bottom up to term_h, leaving screen-top tab_bar_height for GDI.
+        const term_height = @max(1, height - self.tab_bar_height);
+        gl.viewport(0, 0, width, term_height) catch {};
     }
 
     fn renderSurface(self: *App) void {
         const hdc = self.hdc orelse return;
         if (self.hglrc == null) return;
 
+        // Draw GDI tab bar BEFORE OpenGL. GDI+GL mixing on CS_OWNDC
+        // works on most drivers when GDI is drawn first.
+        if (self.tabs.items.len > 1) {
+            const tab_h = self.tab_bar_height;
+            const w = self.viewport_width;
+
+            // Tab bar background
+            const bg_brush = win32CreateSolidBrush(0x242428);
+            var bg_rect: RECT = .{ .left = 0, .top = 0, .right = w, .bottom = tab_h };
+            _ = FillRect(hdc, &bg_rect, bg_brush);
+            _ = DeleteObject(bg_brush);
+
+            // Tab buttons
+            const tab_count: c_int = @intCast(self.tabs.items.len);
+            const tab_w: c_int = @divTrunc(w, tab_count);
+            const clamped_w: c_int = @min(tab_w, 200);
+            const padding: c_int = 2;
+
+            for (self.tabs.items, 0..) |_, i| {
+                const x: c_int = @as(c_int, @intCast(i)) * clamped_w + padding;
+                const bw: c_int = @max(1, clamped_w - 2 * padding);
+                const bh: c_int = @max(1, tab_h - 2 * padding);
+                const is_active = (i == self.active_tab);
+                const color: u32 = if (is_active) @as(u32, 0x333340) else @as(u32, 0x26262C);
+                const brush = win32CreateSolidBrush(color);
+                var rect: RECT = .{ .left = x, .top = padding, .right = x + bw, .bottom = padding + bh };
+                _ = FillRect(hdc, &rect, brush);
+                _ = DeleteObject(brush);
+            }
+        }
+
+        // Now render terminal. Use drawFrame(false) to skip internal glClear,
+        // which would wipe out the GDI tab bar (glClear ignores viewport).
+        const term_h = self.viewport_height - self.tab_bar_height;
         if (self.getActiveSurface()) |s| {
+            if (term_h > 0) {
+                gl.viewport(0, 0, self.viewport_width, term_h) catch {};
+            }
             s.core_surface.renderer.drawFrame(true) catch |err| {
                 log.warn("drawFrame failed: {}", .{err});
             };
@@ -1418,9 +1433,6 @@ pub const App = struct {
             gl.clearColor(0.1, 0.1, 0.12, 1.0);
             gl.clear(gl.c.GL_COLOR_BUFFER_BIT);
         }
-
-        // Draw tab bar on top
-        self.renderTabBar();
 
         _ = SwapBuffers(hdc);
     }
