@@ -3834,28 +3834,29 @@ pub fn deinit(self: *Config) void {
 ///
 /// Detect the best available Windows shell by searching PATH.
 /// Fallback chain: pwsh.exe → powershell.exe → cmd.exe.
+/// Returns the full executable path (no arguments — Ghostty runs
+/// shells directly without an intermediate cmd.exe wrapper).
 fn detectWindowsShell(alloc: Allocator) ![:0]const u8 {
     const shells = [_][]const u8{ "pwsh.exe", "powershell.exe" };
 
-    // Get PATH and search for each candidate
     if (std.process.getEnvVarOwned(alloc, "PATH")) |path_value| {
         defer alloc.free(path_value);
         var it = std.mem.splitScalar(u8, path_value, ';');
         while (it.next()) |dir| {
             for (shells) |shell| {
                 const full_path = try std.fs.path.join(alloc, &.{ dir, shell });
-                defer alloc.free(full_path);
-                // Check if the file exists and is accessible
-                const file_check = std.fs.openFileAbsolute(full_path, .{}) catch continue;
+                const file_check = std.fs.openFileAbsolute(full_path, .{}) catch {
+                    alloc.free(full_path);
+                    continue;
+                };
                 file_check.close();
-                // Return only the executable name (not full path) for consistent
-                // shell behavior — Windows resolves via PATH
-                return try alloc.dupeZ(u8, shell);
+                // PowerShell needs -NoLogo for reliable ConPTY startup
+                const arg = try std.mem.concatWithSentinel(alloc, u8, &.{ shell, " -NoLogo" }, 0);
+                return arg;
             }
         }
     } else |_| {}
 
-    // Always fall back to cmd.exe
     return try alloc.dupeZ(u8, "cmd.exe");
 }
 
