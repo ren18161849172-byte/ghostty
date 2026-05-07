@@ -302,6 +302,7 @@ extern "kernel32" fn GlobalAlloc(u32, usize) callconv(.winapi) ?*anyopaque;
 extern "kernel32" fn GlobalLock(?*anyopaque) callconv(.winapi) ?*anyopaque;
 extern "kernel32" fn GlobalUnlock(?*anyopaque) callconv(.winapi) BOOL;
 extern "kernel32" fn GlobalSize(?*anyopaque) callconv(.winapi) usize;
+extern "kernel32" fn GlobalFree(?*anyopaque) callconv(.winapi) ?*anyopaque;
 extern "gdi32" fn ChoosePixelFormat(HDC, *const PIXELFORMATDESCRIPTOR) callconv(.winapi) c_int;
 extern "gdi32" fn SetPixelFormat(HDC, c_int, *const PIXELFORMATDESCRIPTOR) callconv(.winapi) BOOL;
 extern "gdi32" fn SwapBuffers(HDC) callconv(.winapi) BOOL;
@@ -613,12 +614,14 @@ fn writeClipboardUtf8(text: []const u8) !void {
 
     const data_size: usize = utf16.len * @sizeOf(u16);
     const h_mem = GlobalAlloc(GHND, data_size) orelse return error.OutOfMemory;
-    const p_mem = GlobalLock(h_mem) orelse {
-        _ = GlobalUnlock(h_mem);
-        return error.OutOfMemory;
-    };
+    var owns_h_mem = true;
+    defer {
+        if (owns_h_mem) _ = GlobalFree(h_mem);
+    }
+
+    const p_mem = GlobalLock(h_mem) orelse return error.OutOfMemory;
+    defer _ = GlobalUnlock(h_mem);
     @memcpy(@as([*]u8, @ptrCast(p_mem))[0..data_size], @as([*]const u8, @ptrCast(utf16.ptr))[0..data_size]);
-    _ = GlobalUnlock(h_mem);
 
     if (OpenClipboard(null) == 0) return error.ClipboardOpenFailed;
     defer _ = CloseClipboard();
@@ -626,6 +629,8 @@ fn writeClipboardUtf8(text: []const u8) !void {
     if (SetClipboardData(CF_UNICODETEXT, h_mem) == null) {
         return error.ClipboardSetFailed;
     }
+    // Windows now owns h_mem — don't free
+    owns_h_mem = false;
 }
 
 // ── IME helpers ────────────────────────────────────────
@@ -740,8 +745,11 @@ fn wndProc(hwnd: HWND, msg_type: u32, wparam: WPARAM, lparam: LPARAM) callconv(.
                 const width: u32 = @intCast(lparam & 0xFFFF);
                 const height: u32 = @intCast((lparam >> 16) & 0xFFFF);
                 a.updateViewport(@intCast(width), @intCast(height));
-                // Notify ALL tabs of new size
-                const term_height = height - @as(u32, @intCast(a.tab_bar_height));
+                // Notify ALL tabs of new size (guard against underflow)
+                const term_height: u32 = if (height > @as(u32, @intCast(a.tab_bar_height)))
+                    height - @as(u32, @intCast(a.tab_bar_height))
+                else
+                    1;
                 for (a.tabs.items) |s| {
                     s.core_surface.sizeCallback(.{
                         .width = width,
@@ -972,6 +980,12 @@ fn wndProc(hwnd: HWND, msg_type: u32, wparam: WPARAM, lparam: LPARAM) callconv(.
             }
             return DefWindowProcW(hwnd, msg_type, wparam, lparam);
         },
+        WM_APP_WAKEUP => {
+            if (app) |a| {
+                if (a.hwnd) |hw| _ = InvalidateRect(hw, null, 0);
+            }
+            return 0;
+        },
         else => return DefWindowProcW(hwnd, msg_type, wparam, lparam),
     }
 }
@@ -1127,7 +1141,11 @@ pub const App = struct {
         try self.tab_titles.append(alloc, title);
         self.active_tab = self.tabs.items.len - 1;
 
-        // Notify surface of current viewport size
+        // Update tab bar AND viewport BEFORE notifying surface of size
+        self.updateTabBarHeight();
+        self.updateViewport(self.viewport_width, self.viewport_height);
+
+        // Notify surface of viewport size with correct tab_bar_height
         if (self.viewport_width > 0 and self.viewport_height > self.tab_bar_height) {
             const term_height: u32 = @intCast(self.viewport_height - self.tab_bar_height);
             surface.core_surface.sizeCallback(.{
@@ -1139,7 +1157,6 @@ pub const App = struct {
             surface.core_surface.focusCallback(true) catch {};
         }
 
-        self.updateTabBarHeight();
         log.info("tab created, total={d}", .{self.tabs.items.len});
     }
 
@@ -1343,9 +1360,12 @@ pub const App = struct {
         if (self.hglrc == null) return;
         self.viewport_width = width;
         self.viewport_height = height;
+        // OpenGL viewport origin is bottom-left. Use reduced height so
+        // the top tab_bar_height pixels remain free for the GDI tab bar.
+        // Screen layout: [GDI tab bar] top + [OpenGL terminal] below.
         const term_height = height - self.tab_bar_height;
         if (term_height > 0) {
-            gl.viewport(0, self.tab_bar_height, width, term_height) catch {};
+            gl.viewport(0, 0, width, term_height) catch {};
         }
     }
 
