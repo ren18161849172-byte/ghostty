@@ -8,6 +8,7 @@ const apprt = @import("../apprt.zig");
 const CoreApp = @import("../App.zig");
 const CoreSurface = @import("../Surface.zig");
 const configpkg = @import("../config.zig");
+const renderer = @import("../renderer.zig");
 pub const resourcesDir = internal_os.resourcesDir;
 
 const log = std.log.scoped(.win32);
@@ -125,7 +126,6 @@ const CS_VREDRAW: u32 = 0x0001;
 const CS_OWNDC: u32 = 0x0020;
 const SW_SHOW: c_int = 5;
 const CW_USEDEFAULT: c_int = @bitCast(@as(u32, 0x80000000));
-const COLOR_WINDOW: usize = 5;
 const GWLP_USERDATA: c_int = -21;
 const IDC_ARROW: [*:0]const u16 = @ptrFromInt(32512);
 const SWP_NOZORDER: u32 = 0x0004;
@@ -173,6 +173,7 @@ extern "user32" fn GetDC(?HWND) callconv(.winapi) ?HDC;
 extern "user32" fn GetClientRect(HWND, *RECT) callconv(.winapi) BOOL;
 extern "user32" fn ValidateRect(?HWND, ?*const RECT) callconv(.winapi) BOOL;
 extern "user32" fn MessageBoxW(?HWND, [*:0]const u16, [*:0]const u16, u32) callconv(.winapi) c_int;
+extern "user32" fn InvalidateRect(?HWND, ?*const RECT, BOOL) callconv(.winapi) BOOL;
 
 // ── GDI extern functions ──────────────────────────────
 extern "gdi32" fn ChoosePixelFormat(HDC, *const PIXELFORMATDESCRIPTOR) callconv(.winapi) c_int;
@@ -226,7 +227,7 @@ fn wndProc(hwnd: HWND, msg_type: u32, wparam: WPARAM, lparam: LPARAM) callconv(.
         },
         WM_PAINT => {
             if (app) |a| {
-                a.render();
+                a.renderSurface();
                 _ = ValidateRect(hwnd, null);
             } else {
                 var ps: PAINTSTRUCT = std.mem.zeroes(PAINTSTRUCT);
@@ -249,6 +250,8 @@ fn wndProc(hwnd: HWND, msg_type: u32, wparam: WPARAM, lparam: LPARAM) callconv(.
 
 // ── App ────────────────────────────────────────────────
 pub const App = struct {
+    pub const must_draw_from_app_thread = true;
+
     core_app: *CoreApp,
     hwnd: ?HWND,
     h_instance: HINSTANCE,
@@ -258,6 +261,8 @@ pub const App = struct {
     wgl_swap_interval: ?*const fn (c_int) callconv(.winapi) BOOL,
     viewport_width: c_int,
     viewport_height: c_int,
+    surface: ?*Surface,
+    config: ?configpkg.Config,
 
     pub fn init(
         self: *App,
@@ -280,6 +285,8 @@ pub const App = struct {
             .wgl_swap_interval = null,
             .viewport_width = 0,
             .viewport_height = 0,
+            .surface = null,
+            .config = null,
         };
 
         const wc = WNDCLASSEXW{
@@ -323,16 +330,53 @@ pub const App = struct {
             return err;
         };
 
-        _ = ShowWindow(hwnd, SW_SHOW);
+        // Load configuration (user config files + defaults)
+        var config = configpkg.Config.load(core_app.alloc) catch |err| blk: {
+            log.warn("config load failed, using defaults: {}", .{err});
+            break :blk try configpkg.Config.default(core_app.alloc);
+        };
+        errdefer config.deinit();
 
+        // Create and initialize the terminal surface
+        try self.initSurface(&config);
+        self.config = config;
+
+        _ = ShowWindow(hwnd, SW_SHOW);
         log.info("window created, DPI={}", .{self.dpi});
+    }
+
+    fn initSurface(self: *App, config: *const configpkg.Config) !void {
+        const alloc = self.core_app.alloc;
+
+        const surface = try alloc.create(Surface);
+        errdefer alloc.destroy(surface);
+        surface.* = .{
+            .app = self,
+            .core_surface = undefined,
+        };
+
+        try self.core_app.addSurface(surface);
+
+        surface.core_surface.init(
+            alloc,
+            config,
+            self.core_app,
+            self,
+            surface,
+        ) catch |err| {
+            log.err("CoreSurface init failed: {}", .{err});
+            self.core_app.deleteSurface(surface);
+            return err;
+        };
+
+        self.surface = surface;
+        log.info("terminal surface initialized", .{});
     }
 
     fn initOpenGL(self: *App) !void {
         const hwnd = self.hwnd orelse return error.NoWindow;
         const hdc = GetDC(hwnd) orelse return error.NoDeviceContext;
 
-        // Set up a basic pixel format for double-buffered RGBA rendering
         var pfd = std.mem.zeroes(PIXELFORMATDESCRIPTOR);
         pfd.nSize = @sizeOf(PIXELFORMATDESCRIPTOR);
         pfd.nVersion = 1;
@@ -346,18 +390,15 @@ pub const App = struct {
         if (format == 0) return error.ChoosePixelFormatFailed;
         if (SetPixelFormat(hdc, format, &pfd) == 0) return error.SetPixelFormatFailed;
 
-        // Create a legacy GL context to bootstrap extension loading
         const legacy_ctx = wglCreateContext(hdc) orelse return error.WglCreateContextFailed;
         if (wglMakeCurrent(hdc, legacy_ctx) == 0) return error.WglMakeCurrentFailed;
 
-        // Load WGL extensions through the legacy context
         const create_ctx_attribs: ?*const fn (?HDC, ?HGLRC, ?[*]const c_int) callconv(.winapi) ?HGLRC =
             @ptrCast(wglGetProcAddress("wglCreateContextAttribsARB"));
 
         self.wgl_swap_interval = @ptrCast(wglGetProcAddress("wglSwapIntervalEXT"));
 
         if (create_ctx_attribs) |createCtx| {
-            // Request an OpenGL 4.3 core profile context
             const attribs = [_]c_int{
                 WGL_CONTEXT_MAJOR_VERSION_ARB, 4,
                 WGL_CONTEXT_MINOR_VERSION_ARB, 3,
@@ -384,7 +425,6 @@ pub const App = struct {
 
         self.hdc = hdc;
 
-        // Load GL function pointers via GLAD
         const version = gl.glad.load(null) catch return error.GLADLoadFailed;
         const major = gl.glad.versionMajor(@intCast(version));
         const minor = gl.glad.versionMinor(@intCast(version));
@@ -394,15 +434,13 @@ pub const App = struct {
             return error.OpenGL43NotSupported;
         }
 
-        // VSync on by default
         if (self.wgl_swap_interval) |setInterval| {
             _ = setInterval(1);
             log.info("VSync enabled", .{});
         }
 
-        // Set initial viewport from the client area
         var rect: RECT = std.mem.zeroes(RECT);
-        _ = GetClientRect(hwnd, &rect);
+        _ = GetClientRect(self.hwnd.?, &rect);
         self.viewport_width = rect.right - rect.left;
         self.viewport_height = rect.bottom - rect.top;
         gl.viewport(0, 0, self.viewport_width, self.viewport_height) catch {};
@@ -425,12 +463,18 @@ pub const App = struct {
         gl.viewport(0, 0, width, height) catch {};
     }
 
-    fn render(self: *App) void {
+    fn renderSurface(self: *App) void {
         const hdc = self.hdc orelse return;
         if (self.hglrc == null) return;
 
-        gl.clearColor(0.1, 0.1, 0.12, 1.0);
-        gl.clear(gl.c.GL_COLOR_BUFFER_BIT);
+        if (self.surface) |s| {
+            s.core_surface.renderer.drawFrame(true) catch |err| {
+                log.warn("drawFrame failed: {}", .{err});
+            };
+        } else {
+            gl.clearColor(0.1, 0.1, 0.12, 1.0);
+            gl.clear(gl.c.GL_COLOR_BUFFER_BIT);
+        }
         _ = SwapBuffers(hdc);
     }
 
@@ -450,6 +494,15 @@ pub const App = struct {
     }
 
     pub fn terminate(self: *App) void {
+        if (self.surface) |s| {
+            s.core_surface.deinit();
+            self.core_app.alloc.destroy(s);
+            self.surface = null;
+        }
+        if (self.config) |*c| {
+            c.deinit();
+            self.config = null;
+        }
         if (self.hglrc) |ctx| {
             _ = wglMakeCurrent(null, null);
             _ = wglDeleteContext(ctx);
@@ -473,11 +526,33 @@ pub const App = struct {
         comptime action: apprt.Action.Key,
         value: apprt.Action.Value(action),
     ) !bool {
-        _ = self;
-        _ = target;
-        _ = value;
-        log.warn("unimplemented action: {s}", .{@tagName(action)});
-        return false;
+        switch (action) {
+            .render => {
+                switch (target) {
+                    .app => {},
+                    .surface => |_| {
+                        if (self.hwnd) |hwnd| _ = InvalidateRect(hwnd, null, 0);
+                    },
+                }
+                return true;
+            },
+            .size_limit,
+            .cell_size,
+            .initial_size,
+            .set_title,
+            .mouse_shape,
+            .mouse_visibility,
+            .renderer_health,
+            => {
+                _ = value;
+                return false;
+            },
+            else => {
+                _ = value;
+                log.warn("unimplemented action: {s}", .{@tagName(action)});
+                return false;
+            },
+        }
     }
 
     pub fn performIpc(
@@ -488,27 +563,30 @@ pub const App = struct {
     ) !bool {
         return false;
     }
+
+    pub fn redrawInspector(_: *App, _: *Surface) void {}
 };
 
-// ── Surface (stub — fleshed out in Issue #5+) ─────────
+// ── Surface ───────────────────────────────────────────
 pub const Surface = struct {
+    app: *App,
+    core_surface: CoreSurface,
+
     pub fn deinit(self: *Surface) void {
-        _ = self;
+        self.core_surface.deinit();
     }
 
     pub fn close(self: *Surface, process_active: bool) void {
-        _ = self;
         _ = process_active;
+        _ = self;
     }
 
     pub fn core(self: *Surface) *CoreSurface {
-        _ = self;
-        unreachable;
+        return &self.core_surface;
     }
 
     pub fn rtApp(self: *Surface) *App {
-        _ = self;
-        unreachable;
+        return self.app;
     }
 
     pub fn getTitle(self: *Surface) ?[:0]const u8 {
@@ -517,12 +595,20 @@ pub const Surface = struct {
     }
 
     pub fn getContentScale(self: *const Surface) !apprt.ContentScale {
-        _ = self;
-        return .{ .x = 1, .y = 1 };
+        const scale: f32 = @as(f32, @floatFromInt(self.app.dpi)) / 96.0;
+        return .{ .x = scale, .y = scale };
     }
 
     pub fn getSize(self: *const Surface) !apprt.SurfaceSize {
-        _ = self;
+        const a = self.app;
+        if (a.hwnd) |hwnd| {
+            var rect: RECT = std.mem.zeroes(RECT);
+            _ = GetClientRect(hwnd, &rect);
+            return .{
+                .width = @intCast(rect.right - rect.left),
+                .height = @intCast(rect.bottom - rect.top),
+            };
+        }
         return .{ .width = 800, .height = 600 };
     }
 
