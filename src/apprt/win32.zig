@@ -903,31 +903,22 @@ fn wndProc(hwnd: HWND, msg_type: u32, wparam: WPARAM, lparam: LPARAM) callconv(.
         WM_MOUSEWHEEL, WM_MOUSEHWHEEL => {
             if (app) |a| {
                 if (a.getActiveSurface()) |s| {
-                    const delta: i16 = @intCast((wparam >> 16) & 0xFFFF);
-                    const scroll_amount: f32 = @floatFromInt(delta);
-                    const lines: f32 = scroll_amount / 120.0;
-                    const mods = getMods();
                     var pos = mousePosFromLParam(lparam);
                     pos.y -= @as(f32, @floatFromInt(a.tab_bar_height));
-                    // Skip scrolls outside terminal area
                     if (pos.y < 0) return 0;
+                    const mods = getMods();
                     const button: input.MouseButton = if (msg_type == WM_MOUSEWHEEL) .four else .five;
-
                     s.core_surface.cursorPosCallback(pos, mods) catch {};
-
-                    const abs_lines = @abs(lines);
-                    var remaining: f32 = abs_lines;
-                    while (remaining > 0.0) {
-                        remaining -= 1.0;
-                        _ = s.core_surface.mouseButtonCallback(.press, button, mods) catch {};
-                        _ = s.core_surface.mouseButtonCallback(.release, button, mods) catch {};
-                    }
+                    _ = s.core_surface.mouseButtonCallback(.press, button, mods) catch {};
+                    _ = s.core_surface.mouseButtonCallback(.release, button, mods) catch {};
                 }
             }
             return 0;
         },
         WM_IME_SETCONTEXT => {
-            // Let DefWindowProc handle default IME activation
+            // When IME wants to show its UI, accept it (return 0).
+            // Do NOT call DefWindowProcW — it interferes with IME window creation.
+            if ((lparam & 0xC0000000) != 0) return 0; // ISC_SHOWUI flags
             return DefWindowProcW(hwnd, msg_type, wparam, lparam);
         },
         WM_IME_STARTCOMPOSITION => {
