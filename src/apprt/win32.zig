@@ -129,6 +129,7 @@ const WM_NCCREATE: u32 = 0x0081;
 const WM_DPICHANGED: u32 = 0x02E0;
 const WM_KEYFIRST: u32 = 0x0100;
 const WM_KEYLAST: u32 = 0x0109;
+const SIZE_MINIMIZED: u32 = 1;
 
 const WS_OVERLAPPEDWINDOW: u32 = 0x00CF0000;
 const CS_HREDRAW: u32 = 0x0002;
@@ -503,6 +504,10 @@ fn wndProc(hwnd: HWND, msg_type: u32, wparam: WPARAM, lparam: LPARAM) callconv(.
         },
         WM_SIZE => {
             if (app) |a| {
+                const wparam_val: u32 = @intCast(wparam & 0xFFFF);
+                // Skip minimized: width/height are 0, which would break
+                // ResizePseudoConsole and the OpenGL viewport.
+                if (wparam_val == SIZE_MINIMIZED) return 0;
                 const width: u32 = @intCast(lparam & 0xFFFF);
                 const height: u32 = @intCast((lparam >> 16) & 0xFFFF);
                 a.updateViewport(@intCast(width), @intCast(height));
