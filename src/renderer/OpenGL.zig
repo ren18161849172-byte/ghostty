@@ -169,6 +169,11 @@ pub fn surfaceInit(surface: *apprt.Surface) !void {
         apprt.gtk,
         => try prepareContext(null),
 
+        // Win32 sets up WGL and loads GLAD in App.initOpenGL before
+        // Surface creation. Re-prepare the context here so the renderer
+        // gets debug output and SRGB framebuffer enabled.
+        apprt.win32 => try prepareContext(null),
+
         apprt.embedded => {
             // TODO(mitchellh): this does nothing today to allow libghostty
             // to compile for OpenGL targets but libghostty is strictly
@@ -208,6 +213,11 @@ pub fn threadEnter(self: *const OpenGL, surface: *apprt.Surface) !void {
             // on the main thread. As such, we don't do anything here.
         },
 
+        apprt.win32 => {
+            // Win32 renders on the main thread (message loop). The WGL
+            // context is already current there, so nothing to do here.
+        },
+
         apprt.embedded => {
             // TODO(mitchellh): this does nothing today to allow libghostty
             // to compile for OpenGL targets but libghostty is strictly
@@ -227,6 +237,8 @@ pub fn threadExit(self: *const OpenGL) void {
             // We don't need to do any unloading for GTK because we may
             // be sharing the global bindings with other windows.
         },
+
+        apprt.win32 => {},
 
         apprt.embedded => {
             // TODO: see threadEnter

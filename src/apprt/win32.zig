@@ -1,6 +1,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const windows = std.os.windows;
+const gl = @import("opengl");
 
 const internal_os = @import("../os/main.zig");
 const apprt = @import("../apprt.zig");
@@ -78,6 +79,38 @@ const PAINTSTRUCT = extern struct {
     rgbReserved: [32]u8,
 };
 
+// ── WGL / OpenGL types ────────────────────────────────
+const HGLRC = *opaque {};
+
+const PIXELFORMATDESCRIPTOR = extern struct {
+    nSize: u16,
+    nVersion: u16,
+    dwFlags: u32,
+    iPixelType: u8,
+    cColorBits: u8,
+    cRedBits: u8,
+    cRedShift: u8,
+    cGreenBits: u8,
+    cGreenShift: u8,
+    cBlueBits: u8,
+    cBlueShift: u8,
+    cAlphaBits: u8,
+    cAlphaShift: u8,
+    cAccumBits: u8,
+    cAccumRedBits: u8,
+    cAccumGreenBits: u8,
+    cAccumBlueBits: u8,
+    cAccumAlphaBits: u8,
+    cDepthBits: u8,
+    cStencilBits: u8,
+    cAuxBuffers: u8,
+    iLayerType: u8,
+    bReserved: u8,
+    dwLayerMask: u32,
+    dwVisibleMask: u32,
+    dwDamageMask: u32,
+};
+
 // ── Win32 constants ────────────────────────────────────
 const WM_DESTROY: u32 = 0x0002;
 const WM_SIZE: u32 = 0x0005;
@@ -99,6 +132,19 @@ const SWP_NOZORDER: u32 = 0x0004;
 const SWP_NOACTIVATE: u32 = 0x0010;
 const WM_APP_WAKEUP: u32 = 0x0400;
 const DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2: isize = -4;
+const MB_ICONERROR: u32 = 0x00000010;
+
+// ── WGL / Pixel format constants ──────────────────────
+const PFD_DRAW_TO_WINDOW: u32 = 0x00000004;
+const PFD_SUPPORT_OPENGL: u32 = 0x00000020;
+const PFD_DOUBLEBUFFER: u32 = 0x00000001;
+const PFD_TYPE_RGBA: u8 = 0;
+
+const WGL_CONTEXT_MAJOR_VERSION_ARB: c_int = 0x2091;
+const WGL_CONTEXT_MINOR_VERSION_ARB: c_int = 0x2092;
+const WGL_CONTEXT_PROFILE_MASK_ARB: c_int = 0x9126;
+const WGL_CONTEXT_CORE_PROFILE_BIT_ARB: c_int = 0x00000001;
+const WGL_CONTEXT_FLAGS_ARB: c_int = 0x2094;
 
 const CLASS_NAME = std.unicode.utf8ToUtf16LeStringLiteral("GhosttyWindow");
 const WINDOW_TITLE = std.unicode.utf8ToUtf16LeStringLiteral("Ghostty");
@@ -123,6 +169,21 @@ extern "user32" fn SetWindowPos(HWND, ?HWND, c_int, c_int, c_int, c_int, u32) ca
 extern "user32" fn BeginPaint(HWND, *PAINTSTRUCT) callconv(.winapi) ?HDC;
 extern "user32" fn EndPaint(HWND, *const PAINTSTRUCT) callconv(.winapi) BOOL;
 extern "kernel32" fn GetModuleHandleW(?[*:0]const u16) callconv(.winapi) ?HINSTANCE;
+extern "user32" fn GetDC(?HWND) callconv(.winapi) ?HDC;
+extern "user32" fn GetClientRect(HWND, *RECT) callconv(.winapi) BOOL;
+extern "user32" fn ValidateRect(?HWND, ?*const RECT) callconv(.winapi) BOOL;
+extern "user32" fn MessageBoxW(?HWND, [*:0]const u16, [*:0]const u16, u32) callconv(.winapi) c_int;
+
+// ── GDI extern functions ──────────────────────────────
+extern "gdi32" fn ChoosePixelFormat(HDC, *const PIXELFORMATDESCRIPTOR) callconv(.winapi) c_int;
+extern "gdi32" fn SetPixelFormat(HDC, c_int, *const PIXELFORMATDESCRIPTOR) callconv(.winapi) BOOL;
+extern "gdi32" fn SwapBuffers(HDC) callconv(.winapi) BOOL;
+
+// ── WGL extern functions ──────────────────────────────
+extern "opengl32" fn wglCreateContext(HDC) callconv(.winapi) ?HGLRC;
+extern "opengl32" fn wglMakeCurrent(?HDC, ?HGLRC) callconv(.winapi) BOOL;
+extern "opengl32" fn wglDeleteContext(HGLRC) callconv(.winapi) BOOL;
+extern "opengl32" fn wglGetProcAddress([*:0]const u8) callconv(.winapi) ?*const fn () callconv(.c) void;
 
 // ── Window procedure ───────────────────────────────────
 fn wndProc(hwnd: HWND, msg_type: u32, wparam: WPARAM, lparam: LPARAM) callconv(.winapi) LRESULT {
@@ -164,14 +225,21 @@ fn wndProc(hwnd: HWND, msg_type: u32, wparam: WPARAM, lparam: LPARAM) callconv(.
             return 0;
         },
         WM_PAINT => {
-            var ps: PAINTSTRUCT = std.mem.zeroes(PAINTSTRUCT);
-            _ = BeginPaint(hwnd, &ps);
-            _ = EndPaint(hwnd, &ps);
+            if (app) |a| {
+                a.render();
+                _ = ValidateRect(hwnd, null);
+            } else {
+                var ps: PAINTSTRUCT = std.mem.zeroes(PAINTSTRUCT);
+                _ = BeginPaint(hwnd, &ps);
+                _ = EndPaint(hwnd, &ps);
+            }
             return 0;
         },
         WM_SIZE => {
-            if (app) |_| {
-                // Surface resize will be handled in Issue #4+
+            if (app) |a| {
+                const width: c_int = @intCast(lparam & 0xFFFF);
+                const height: c_int = @intCast((lparam >> 16) & 0xFFFF);
+                a.updateViewport(width, height);
             }
             return 0;
         },
@@ -185,6 +253,11 @@ pub const App = struct {
     hwnd: ?HWND,
     h_instance: HINSTANCE,
     dpi: u32,
+    hdc: ?HDC,
+    hglrc: ?HGLRC,
+    wgl_swap_interval: ?*const fn (c_int) callconv(.winapi) BOOL,
+    viewport_width: c_int,
+    viewport_height: c_int,
 
     pub fn init(
         self: *App,
@@ -193,20 +266,22 @@ pub const App = struct {
     ) !void {
         _ = opts;
 
-        // Per-Monitor V2 DPI awareness (Windows 10 1703+, our minimum is 22H2)
         _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
 
         const h_instance = GetModuleHandleW(null) orelse return error.NoModuleHandle;
 
-        // Pre-initialize so WndProc can safely access fields during CreateWindowExW
         self.* = .{
             .core_app = core_app,
             .hwnd = null,
             .h_instance = h_instance,
             .dpi = 96,
+            .hdc = null,
+            .hglrc = null,
+            .wgl_swap_interval = null,
+            .viewport_width = 0,
+            .viewport_height = 0,
         };
 
-        const bg_brush: HBRUSH = @ptrFromInt(COLOR_WINDOW + 1);
         const wc = WNDCLASSEXW{
             .cbSize = @sizeOf(WNDCLASSEXW),
             .style = CS_HREDRAW | CS_VREDRAW | CS_OWNDC,
@@ -216,7 +291,7 @@ pub const App = struct {
             .hInstance = h_instance,
             .hIcon = null,
             .hCursor = LoadCursorW(null, IDC_ARROW),
-            .hbrBackground = bg_brush,
+            .hbrBackground = null,
             .lpszMenuName = null,
             .lpszClassName = CLASS_NAME,
             .hIconSm = null,
@@ -242,9 +317,121 @@ pub const App = struct {
         self.hwnd = hwnd;
         self.dpi = GetDpiForWindow(hwnd);
 
+        self.initOpenGL() catch |err| {
+            log.err("OpenGL init failed: {}", .{err});
+            showGLError(hwnd);
+            return err;
+        };
+
         _ = ShowWindow(hwnd, SW_SHOW);
 
         log.info("window created, DPI={}", .{self.dpi});
+    }
+
+    fn initOpenGL(self: *App) !void {
+        const hwnd = self.hwnd orelse return error.NoWindow;
+        const hdc = GetDC(hwnd) orelse return error.NoDeviceContext;
+
+        // Set up a basic pixel format for double-buffered RGBA rendering
+        var pfd = std.mem.zeroes(PIXELFORMATDESCRIPTOR);
+        pfd.nSize = @sizeOf(PIXELFORMATDESCRIPTOR);
+        pfd.nVersion = 1;
+        pfd.dwFlags = PFD_DRAW_TO_WINDOW | PFD_SUPPORT_OPENGL | PFD_DOUBLEBUFFER;
+        pfd.iPixelType = PFD_TYPE_RGBA;
+        pfd.cColorBits = 32;
+        pfd.cDepthBits = 24;
+        pfd.cStencilBits = 8;
+
+        const format = ChoosePixelFormat(hdc, &pfd);
+        if (format == 0) return error.ChoosePixelFormatFailed;
+        if (SetPixelFormat(hdc, format, &pfd) == 0) return error.SetPixelFormatFailed;
+
+        // Create a legacy GL context to bootstrap extension loading
+        const legacy_ctx = wglCreateContext(hdc) orelse return error.WglCreateContextFailed;
+        if (wglMakeCurrent(hdc, legacy_ctx) == 0) return error.WglMakeCurrentFailed;
+
+        // Load WGL extensions through the legacy context
+        const create_ctx_attribs: ?*const fn (?HDC, ?HGLRC, ?[*]const c_int) callconv(.winapi) ?HGLRC =
+            @ptrCast(wglGetProcAddress("wglCreateContextAttribsARB"));
+
+        self.wgl_swap_interval = @ptrCast(wglGetProcAddress("wglSwapIntervalEXT"));
+
+        if (create_ctx_attribs) |createCtx| {
+            // Request an OpenGL 4.3 core profile context
+            const attribs = [_]c_int{
+                WGL_CONTEXT_MAJOR_VERSION_ARB, 4,
+                WGL_CONTEXT_MINOR_VERSION_ARB, 3,
+                WGL_CONTEXT_PROFILE_MASK_ARB,  WGL_CONTEXT_CORE_PROFILE_BIT_ARB,
+                0,
+            };
+
+            const modern_ctx = createCtx(hdc, null, &attribs) orelse {
+                _ = wglMakeCurrent(null, null);
+                _ = wglDeleteContext(legacy_ctx);
+                return error.OpenGL43NotSupported;
+            };
+
+            _ = wglMakeCurrent(null, null);
+            _ = wglDeleteContext(legacy_ctx);
+
+            if (wglMakeCurrent(hdc, modern_ctx) == 0) return error.WglMakeCurrentFailed;
+            self.hglrc = modern_ctx;
+        } else {
+            _ = wglMakeCurrent(null, null);
+            _ = wglDeleteContext(legacy_ctx);
+            return error.OpenGL43NotSupported;
+        }
+
+        self.hdc = hdc;
+
+        // Load GL function pointers via GLAD
+        const version = gl.glad.load(null) catch return error.GLADLoadFailed;
+        const major = gl.glad.versionMajor(@intCast(version));
+        const minor = gl.glad.versionMinor(@intCast(version));
+        log.info("OpenGL {}.{} loaded via WGL", .{ major, minor });
+
+        if (major < 4 or (major == 4 and minor < 3)) {
+            return error.OpenGL43NotSupported;
+        }
+
+        // VSync on by default
+        if (self.wgl_swap_interval) |setInterval| {
+            _ = setInterval(1);
+            log.info("VSync enabled", .{});
+        }
+
+        // Set initial viewport from the client area
+        var rect: RECT = std.mem.zeroes(RECT);
+        _ = GetClientRect(hwnd, &rect);
+        self.viewport_width = rect.right - rect.left;
+        self.viewport_height = rect.bottom - rect.top;
+        gl.viewport(0, 0, self.viewport_width, self.viewport_height) catch {};
+
+        log.info("GL viewport {}x{}", .{ self.viewport_width, self.viewport_height });
+    }
+
+    fn showGLError(hwnd: ?HWND) void {
+        const msg = std.unicode.utf8ToUtf16LeStringLiteral(
+            "Ghostty requires OpenGL 4.3 or later.\r\n\r\nPlease update your graphics drivers.",
+        );
+        const title = std.unicode.utf8ToUtf16LeStringLiteral("Ghostty \u{2013} Graphics Error");
+        _ = MessageBoxW(hwnd, msg, title, MB_ICONERROR);
+    }
+
+    fn updateViewport(self: *App, width: c_int, height: c_int) void {
+        if (self.hglrc == null) return;
+        self.viewport_width = width;
+        self.viewport_height = height;
+        gl.viewport(0, 0, width, height) catch {};
+    }
+
+    fn render(self: *App) void {
+        const hdc = self.hdc orelse return;
+        if (self.hglrc == null) return;
+
+        gl.clearColor(0.1, 0.1, 0.12, 1.0);
+        gl.clear(gl.c.GL_COLOR_BUFFER_BIT);
+        _ = SwapBuffers(hdc);
     }
 
     pub fn run(self: *App) !void {
@@ -263,6 +450,11 @@ pub const App = struct {
     }
 
     pub fn terminate(self: *App) void {
+        if (self.hglrc) |ctx| {
+            _ = wglMakeCurrent(null, null);
+            _ = wglDeleteContext(ctx);
+            self.hglrc = null;
+        }
         if (self.hwnd) |hwnd| {
             _ = DestroyWindow(hwnd);
             self.hwnd = null;
@@ -298,7 +490,7 @@ pub const App = struct {
     }
 };
 
-// ── Surface (stub — fleshed out in Issues #4+) ────────
+// ── Surface (stub — fleshed out in Issue #5+) ─────────
 pub const Surface = struct {
     pub fn deinit(self: *Surface) void {
         _ = self;
