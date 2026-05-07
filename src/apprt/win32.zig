@@ -707,7 +707,7 @@ fn wndProc(hwnd: HWND, msg_type: u32, wparam: WPARAM, lparam: LPARAM) callconv(.
         WM_DPICHANGED => {
             if (app) |a| {
                 a.dpi = @truncate(wparam & 0xFFFF);
-                a.tab_bar_height = App.computeTabBarHeight(a.dpi);
+                a.updateTabBarHeight();
                 const suggested: *const RECT = @ptrFromInt(@as(usize, @bitCast(lparam)));
                 _ = SetWindowPos(
                     hwnd,
@@ -1087,8 +1087,8 @@ pub const App = struct {
         errdefer config.deinit();
 
         // Create initial tab
-        self.tab_bar_height = App.computeTabBarHeight(self.dpi);
         try self.createTab(&config);
+        self.updateTabBarHeight();
         self.config = config;
 
         _ = ShowWindow(hwnd, SW_SHOW);
@@ -1139,6 +1139,7 @@ pub const App = struct {
             surface.core_surface.focusCallback(true) catch {};
         }
 
+        self.updateTabBarHeight();
         log.info("tab created, total={d}", .{self.tabs.items.len});
     }
 
@@ -1173,6 +1174,19 @@ pub const App = struct {
         if (self.tabs.items.len == 0) {
             if (self.hwnd) |hwnd| _ = DestroyWindow(hwnd);
             return;
+        }
+
+        self.updateTabBarHeight();
+        // Recalculate viewport and notify remaining tabs of new size
+        if (self.viewport_width > 0 and self.viewport_height > 0) {
+            self.updateViewport(self.viewport_width, self.viewport_height);
+            const term_height: u32 = @intCast(@max(1, self.viewport_height - self.tab_bar_height));
+            for (self.tabs.items) |tab_surface| {
+                tab_surface.core_surface.sizeCallback(.{
+                    .width = @intCast(self.viewport_width),
+                    .height = term_height,
+                }) catch {};
+            }
         }
 
         // Focus the new active tab
@@ -1318,11 +1332,17 @@ pub const App = struct {
         _ = MessageBoxW(hwnd, msg, title, MB_ICONERROR);
     }
 
+    fn updateTabBarHeight(self: *App) void {
+        self.tab_bar_height = if (self.tabs.items.len > 1)
+            App.computeTabBarHeight(self.dpi)
+        else
+            0;
+    }
+
     fn updateViewport(self: *App, width: c_int, height: c_int) void {
         if (self.hglrc == null) return;
         self.viewport_width = width;
         self.viewport_height = height;
-        // Terminal area is below the tab bar
         const term_height = height - self.tab_bar_height;
         if (term_height > 0) {
             gl.viewport(0, self.tab_bar_height, width, term_height) catch {};
