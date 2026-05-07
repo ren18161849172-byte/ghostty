@@ -1145,27 +1145,34 @@ pub const App = struct {
     fn closeTab(self: *App, index: usize) void {
         if (index >= self.tabs.items.len) return;
         const alloc = self.core_app.alloc;
+
+        // Remove from lists FIRST — before deinit/destroy triggers
+        // WM_KILLFOCUS/DestroyWindow which queries getActiveSurface().
         const surface = self.tabs.items[index];
-
-        surface.core_surface.deinit();
-        self.core_app.deleteSurface(surface);
-        alloc.destroy(surface);
-        alloc.free(self.tab_titles.items[index]);
-
+        const title = self.tab_titles.items[index];
         _ = self.tabs.orderedRemove(index);
         _ = self.tab_titles.orderedRemove(index);
 
-        // Rebalance active_tab
+        // Rebalance active_tab before surface destruction
         if (self.tabs.items.len == 0) {
             self.active_tab = 0;
-            if (self.hwnd) |hwnd| _ = DestroyWindow(hwnd);
-            return;
-        }
-        if (index <= self.active_tab and self.active_tab > 0) {
+        } else if (index <= self.active_tab and self.active_tab > 0) {
             self.active_tab -= 1;
         }
-        if (self.active_tab >= self.tabs.items.len) {
+        if (self.active_tab >= self.tabs.items.len and self.tabs.items.len > 0) {
             self.active_tab = self.tabs.items.len - 1;
+        }
+
+        // Now safe to destroy — getActiveSurface() won't return this surface
+        surface.core_surface.deinit();
+        self.core_app.deleteSurface(surface);
+        alloc.destroy(surface);
+        alloc.free(title);
+
+        // If last tab, close window
+        if (self.tabs.items.len == 0) {
+            if (self.hwnd) |hwnd| _ = DestroyWindow(hwnd);
+            return;
         }
 
         // Focus the new active tab
