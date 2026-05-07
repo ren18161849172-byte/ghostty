@@ -127,9 +127,26 @@ const WM_SYSKEYDOWN: u32 = 0x0104;
 const WM_SYSKEYUP: u32 = 0x0105;
 const WM_NCCREATE: u32 = 0x0081;
 const WM_DPICHANGED: u32 = 0x02E0;
+// ── Mouse message constants ──────────────────────────
+const WM_MOUSEMOVE: u32 = 0x0200;
+const WM_LBUTTONDOWN: u32 = 0x0201;
+const WM_LBUTTONUP: u32 = 0x0202;
+const WM_LBUTTONDBLCLK: u32 = 0x0203;
+const WM_RBUTTONDOWN: u32 = 0x0204;
+const WM_RBUTTONUP: u32 = 0x0205;
+const WM_RBUTTONDBLCLK: u32 = 0x0206;
+const WM_MBUTTONDOWN: u32 = 0x0207;
+const WM_MBUTTONUP: u32 = 0x0208;
+const WM_MOUSEWHEEL: u32 = 0x020A;
+const WM_MOUSEHWHEEL: u32 = 0x020E;
+
 const WM_KEYFIRST: u32 = 0x0100;
 const WM_KEYLAST: u32 = 0x0109;
 const SIZE_MINIMIZED: u32 = 1;
+
+// ── Clipboard format constants ────────────────────────
+const CF_UNICODETEXT: u32 = 13;
+const GHND: u32 = 0x0042;
 
 const WS_OVERLAPPEDWINDOW: u32 = 0x00CF0000;
 const CS_HREDRAW: u32 = 0x0002;
@@ -247,7 +264,17 @@ extern "user32" fn GetKeyboardState(*[256]u8) callconv(.winapi) BOOL;
 extern "user32" fn ToUnicode(u32, u32, *const [256]u8, [*]u16, c_int, u32) callconv(.winapi) c_int;
 extern "user32" fn MapVirtualKeyW(u32, u32) callconv(.winapi) u32;
 
-// ── GDI extern functions ──────────────────────────────
+// ── Mouse/clipboard extern functions ──────────────────
+extern "user32" fn OpenClipboard(?HWND) callconv(.winapi) BOOL;
+extern "user32" fn CloseClipboard() callconv(.winapi) BOOL;
+extern "user32" fn GetClipboardData(u32) callconv(.winapi) ?*anyopaque;
+extern "user32" fn SetClipboardData(u32, ?*anyopaque) callconv(.winapi) ?*anyopaque;
+extern "user32" fn EmptyClipboard() callconv(.winapi) BOOL;
+extern "user32" fn IsClipboardFormatAvailable(u32) callconv(.winapi) BOOL;
+extern "kernel32" fn GlobalAlloc(u32, usize) callconv(.winapi) ?*anyopaque;
+extern "kernel32" fn GlobalLock(?*anyopaque) callconv(.winapi) ?*anyopaque;
+extern "kernel32" fn GlobalUnlock(?*anyopaque) callconv(.winapi) BOOL;
+extern "kernel32" fn GlobalSize(?*anyopaque) callconv(.winapi) usize;
 extern "gdi32" fn ChoosePixelFormat(HDC, *const PIXELFORMATDESCRIPTOR) callconv(.winapi) c_int;
 extern "gdi32" fn SetPixelFormat(HDC, c_int, *const PIXELFORMATDESCRIPTOR) callconv(.winapi) BOOL;
 extern "gdi32" fn SwapBuffers(HDC) callconv(.winapi) BOOL;
@@ -452,6 +479,108 @@ fn getUnshiftedCodepoint(vk: u16) u21 {
     return @intCast(mapped & 0x7FFFFFFF);
 }
 
+// ── Mouse helpers ─────────────────────────────────────
+
+fn mousePosFromLParam(lparam: LPARAM) apprt.CursorPos {
+    const x: i16 = @truncate(lparam & 0xFFFF);
+    const y: i16 = @truncate((lparam >> 16) & 0xFFFF);
+    return .{ .x = @floatFromInt(x), .y = @floatFromInt(y) };
+}
+
+fn mouseButtonFromMsg(msg: u32) input.MouseButton {
+    return switch (msg) {
+        WM_LBUTTONDOWN, WM_LBUTTONUP, WM_LBUTTONDBLCLK => .left,
+        WM_RBUTTONDOWN, WM_RBUTTONUP, WM_RBUTTONDBLCLK => .right,
+        WM_MBUTTONDOWN, WM_MBUTTONUP => .middle,
+        else => .unknown,
+    };
+}
+
+fn mouseActionFromMsg(msg: u32) input.MouseButtonState {
+    return switch (msg) {
+        WM_LBUTTONDOWN, WM_RBUTTONDOWN, WM_MBUTTONDOWN => .press,
+        WM_LBUTTONUP, WM_RBUTTONUP, WM_MBUTTONUP => .release,
+        WM_LBUTTONDBLCLK, WM_RBUTTONDBLCLK => .press,
+        else => .release,
+    };
+}
+
+// ── Clipboard helpers ──────────────────────────────────
+
+fn readClipboardUtf8(alloc: Allocator) !?[:0]const u8 {
+    if (OpenClipboard(null) == 0) return error.ClipboardOpenFailed;
+    defer _ = CloseClipboard();
+
+    if (IsClipboardFormatAvailable(CF_UNICODETEXT) == 0) return null;
+
+    const h_data = GetClipboardData(CF_UNICODETEXT) orelse return null;
+    const p_data = GlobalLock(h_data) orelse return null;
+    defer _ = GlobalUnlock(h_data);
+    const size = GlobalSize(h_data);
+    if (size < 2) return null;
+
+    const utf16_ptr: [*]const u16 = @ptrCast(@alignCast(p_data));
+    const utf16_len = (size / 2) -| 1; // minus null terminator
+    if (utf16_len == 0) return null;
+    const utf16_slice = utf16_ptr[0..utf16_len];
+
+    // Manual UTF-16LE to UTF-8 conversion
+    var result = try std.ArrayList(u8).initCapacity(alloc, utf16_len * 3);
+    errdefer result.deinit(alloc);
+    var it = std.unicode.Utf16LeIterator.init(utf16_slice);
+    while (it.nextCodepoint() catch null) |cp| {
+        var buf: [4]u8 = undefined;
+        const cp_len = try std.unicode.utf8Encode(cp, &buf);
+        try result.appendSlice(alloc, buf[0..cp_len]);
+    }
+    return try result.toOwnedSliceSentinel(alloc, 0);
+}
+
+fn utf8ToUtf16Le(alloc: Allocator, text: []const u8) ![]const u16 {
+    var list = try std.ArrayList(u16).initCapacity(alloc, text.len + 1);
+    errdefer list.deinit(alloc);
+    var i: usize = 0;
+    while (i < text.len) {
+        const cp_len = try std.unicode.utf8ByteSequenceLength(text[i]);
+        if (i + cp_len > text.len) break;
+        const cp = try std.unicode.utf8Decode(text[i .. i + cp_len]);
+        i += cp_len;
+        // Encode to UTF-16LE (surrogate pairs for codepoints > 0xFFFF)
+        if (cp <= 0xFFFF) {
+            try list.append(alloc, @intCast(cp));
+        } else if (cp <= 0x10FFFF) {
+            const adjusted = cp - 0x10000;
+            try list.append(alloc, @intCast(0xD800 | (adjusted >> 10)));
+            try list.append(alloc, @intCast(0xDC00 | (adjusted & 0x3FF)));
+        }
+    }
+    try list.append(alloc, 0); // null terminator
+    return try list.toOwnedSlice(alloc);
+}
+
+fn writeClipboardUtf8(text: []const u8) !void {
+    if (text.len == 0) return;
+
+    const utf16 = try utf8ToUtf16Le(std.heap.page_allocator, text);
+    defer std.heap.page_allocator.free(utf16);
+
+    const data_size: usize = utf16.len * @sizeOf(u16);
+    const h_mem = GlobalAlloc(GHND, data_size) orelse return error.OutOfMemory;
+    const p_mem = GlobalLock(h_mem) orelse {
+        _ = GlobalUnlock(h_mem);
+        return error.OutOfMemory;
+    };
+    @memcpy(@as([*]u8, @ptrCast(p_mem))[0..data_size], @as([*]const u8, @ptrCast(utf16.ptr))[0..data_size]);
+    _ = GlobalUnlock(h_mem);
+
+    if (OpenClipboard(null) == 0) return error.ClipboardOpenFailed;
+    defer _ = CloseClipboard();
+    _ = EmptyClipboard();
+    if (SetClipboardData(CF_UNICODETEXT, h_mem) == null) {
+        return error.ClipboardSetFailed;
+    }
+}
+
 // ── Window procedure ───────────────────────────────────
 fn wndProc(hwnd: HWND, msg_type: u32, wparam: WPARAM, lparam: LPARAM) callconv(.winapi) LRESULT {
     const ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA);
@@ -561,6 +690,85 @@ fn wndProc(hwnd: HWND, msg_type: u32, wparam: WPARAM, lparam: LPARAM) callconv(.
             // We skip TranslateMessage for keyboard messages (see message loop),
             // so this should rarely fire. If it does, ignore it — we handle
             // text via ToUnicode in WM_KEYDOWN.
+            return 0;
+        },
+        // ── Mouse messages ──────────────────────────────
+        WM_LBUTTONDOWN, WM_LBUTTONUP, WM_LBUTTONDBLCLK, WM_MBUTTONDOWN, WM_MBUTTONUP => {
+            if (app) |a| {
+                if (a.surface) |s| {
+                    const button = mouseButtonFromMsg(msg_type);
+                    const action = mouseActionFromMsg(msg_type);
+                    const mods = getMods();
+                    // Update cursor position first so the core knows where the click is
+                    s.core_surface.cursorPosCallback(mousePosFromLParam(lparam), mods) catch {};
+                    _ = s.core_surface.mouseButtonCallback(action, button, mods) catch |err| {
+                        log.warn("mouseButtonCallback failed: {}", .{err});
+                    };
+                }
+            }
+            return 0;
+        },
+        WM_RBUTTONUP => {
+            if (app) |a| {
+                if (a.surface) |s| {
+                    const mods = getMods();
+                    s.core_surface.cursorPosCallback(mousePosFromLParam(lparam), mods) catch {};
+                    _ = s.core_surface.mouseButtonCallback(.release, .right, mods) catch |err| {
+                        log.warn("mouseButtonCallback failed: {}", .{err});
+                    };
+                }
+            }
+            return 0;
+        },
+        WM_RBUTTONDOWN, WM_RBUTTONDBLCLK => {
+            if (app) |a| {
+                if (a.surface) |s| {
+                    const action = mouseActionFromMsg(msg_type);
+                    const mods = getMods();
+                    s.core_surface.cursorPosCallback(mousePosFromLParam(lparam), mods) catch {};
+                    _ = s.core_surface.mouseButtonCallback(action, .right, mods) catch |err| {
+                        log.warn("mouseButtonCallback failed: {}", .{err});
+                    };
+                }
+            }
+            return 0;
+        },
+        WM_MOUSEMOVE => {
+            if (app) |a| {
+                if (a.surface) |s| {
+                    const mods = getMods();
+                    s.core_surface.cursorPosCallback(
+                        mousePosFromLParam(lparam),
+                        mods,
+                    ) catch |err| {
+                        log.warn("cursorPosCallback failed: {}", .{err});
+                    };
+                }
+            }
+            return 0;
+        },
+        WM_MOUSEWHEEL, WM_MOUSEHWHEEL => {
+            if (app) |a| {
+                if (a.surface) |s| {
+                    const delta: i16 = @intCast((wparam >> 16) & 0xFFFF);
+                    const scroll_amount: f32 = @floatFromInt(delta);
+                    const lines: f32 = scroll_amount / 120.0; // WHEEL_DELTA = 120
+                    const mods = getMods();
+                    const pos = mousePosFromLParam(lparam);
+                    const button: input.MouseButton = if (msg_type == WM_MOUSEWHEEL) .four else .five;
+
+                    // Update cursor position before scroll
+                    s.core_surface.cursorPosCallback(pos, mods) catch {};
+
+                    const abs_lines = @abs(lines);
+                    var remaining: f32 = abs_lines;
+                    while (remaining > 0.0) {
+                        remaining -= 1.0;
+                        _ = s.core_surface.mouseButtonCallback(.press, button, mods) catch {};
+                        _ = s.core_surface.mouseButtonCallback(.release, button, mods) catch {};
+                    }
+                }
+            }
             return 0;
         },
         else => return DefWindowProcW(hwnd, msg_type, wparam, lparam),
@@ -1029,8 +1237,7 @@ pub const Surface = struct {
 
     pub fn supportsClipboard(self: *const Surface, clipboard: apprt.Clipboard) bool {
         _ = self;
-        _ = clipboard;
-        return false;
+        return clipboard == .standard;
     }
 
     pub fn clipboardRequest(
@@ -1038,10 +1245,20 @@ pub const Surface = struct {
         clipboard: apprt.Clipboard,
         request: apprt.ClipboardRequest,
     ) !bool {
-        _ = self;
-        _ = clipboard;
-        _ = request;
-        return false;
+        if (clipboard != .standard) return false;
+
+        const alloc = self.app.core_app.alloc;
+        const text = readClipboardUtf8(alloc) catch |err| {
+            log.warn("clipboard read failed: {}", .{err});
+            return false;
+        } orelse return false;
+        defer alloc.free(text);
+
+        self.core_surface.completeClipboardRequest(request, text, true) catch |err| {
+            log.warn("completeClipboardRequest failed: {}", .{err});
+            return false;
+        };
+        return true;
     }
 
     pub fn setClipboard(
@@ -1051,8 +1268,15 @@ pub const Surface = struct {
         confirm: bool,
     ) !void {
         _ = self;
-        _ = clipboard;
-        _ = contents;
+        if (clipboard != .standard) return;
+        for (contents) |c| {
+            if (std.mem.eql(u8, c.mime, "text/plain")) {
+                writeClipboardUtf8(c.data) catch |err| {
+                    log.warn("clipboard write failed: {}", .{err});
+                };
+                return;
+            }
+        }
         _ = confirm;
     }
 
