@@ -31,6 +31,13 @@ const WNDPROC = *const fn (HWND, u32, WPARAM, LPARAM) callconv(.winapi) LRESULT;
 
 // ── Win32 structs (not in std) ─────────────────────────
 const POINT = extern struct { x: i32, y: i32 };
+const MINMAXINFO = extern struct {
+    ptReserved: POINT,
+    ptMaxSize: POINT,
+    ptMaxPosition: POINT,
+    ptMinTrackSize: POINT,
+    ptMaxTrackSize: POINT,
+};
 const RECT = extern struct { left: i32, top: i32, right: i32, bottom: i32 };
 
 const WNDCLASSEXW = extern struct {
@@ -141,6 +148,7 @@ const WM_SYSKEYDOWN: u32 = 0x0104;
 const WM_SYSKEYUP: u32 = 0x0105;
 const WM_NCCREATE: u32 = 0x0081;
 const WM_DPICHANGED: u32 = 0x02E0;
+const WM_GETMINMAXINFO: u32 = 0x0024;
 // ── Mouse message constants ──────────────────────────
 const WM_MOUSEMOVE: u32 = 0x0200;
 const WM_LBUTTONDOWN: u32 = 0x0201;
@@ -729,6 +737,20 @@ fn wndProc(hwnd: HWND, msg_type: u32, wparam: WPARAM, lparam: LPARAM) callconv(.
         WM_DESTROY => {
             if (app) |a| a.hwnd = null;
             PostQuitMessage(0);
+            return 0;
+        },
+        WM_GETMINMAXINFO => {
+            // Prevent the user from shrinking the window so small that the
+            // terminal grid collapses (U2): when the grid drops below a few
+            // cells the existing on-screen content gets reflowed/truncated
+            // and is unrecoverable on enlarge. Hard floor in logical pixels,
+            // scaled by current DPI so it stays visually consistent.
+            const mmi: *MINMAXINFO = @ptrFromInt(@as(usize, @bitCast(lparam)));
+            const dpi: u32 = if (app) |a| a.dpi else 96;
+            const min_w_logical: i32 = 320;
+            const min_h_logical: i32 = 200;
+            mmi.ptMinTrackSize.x = @divTrunc(min_w_logical * @as(i32, @intCast(dpi)), 96);
+            mmi.ptMinTrackSize.y = @divTrunc(min_h_logical * @as(i32, @intCast(dpi)), 96);
             return 0;
         },
         WM_DPICHANGED => {
