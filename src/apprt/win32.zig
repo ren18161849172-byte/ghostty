@@ -851,6 +851,7 @@ fn wndProc(hwnd: HWND, msg_type: u32, wparam: WPARAM, lparam: LPARAM) callconv(.
                 const term_pos = apprt.CursorPos{ .x = pos.x, .y = pos.y - @as(f32, @floatFromInt(a.tab_bar_height)) };
                 if (a.getActiveSurface()) |s| {
                     const mods = getMods();
+                    s.last_cursor_pos = term_pos;
                     s.core_surface.cursorPosCallback(term_pos, mods) catch {};
                     _ = s.core_surface.mouseButtonCallback(.press, .left, mods) catch |err| {
                         log.warn("mouseButtonCallback failed: {}", .{err});
@@ -868,6 +869,7 @@ fn wndProc(hwnd: HWND, msg_type: u32, wparam: WPARAM, lparam: LPARAM) callconv(.
                     const button = mouseButtonFromMsg(msg_type);
                     const action = mouseActionFromMsg(msg_type);
                     const mods = getMods();
+                    s.last_cursor_pos = pos;
                     s.core_surface.cursorPosCallback(pos, mods) catch {};
                     _ = s.core_surface.mouseButtonCallback(action, button, mods) catch |err| {
                         log.warn("mouseButtonCallback failed: {}", .{err});
@@ -883,6 +885,7 @@ fn wndProc(hwnd: HWND, msg_type: u32, wparam: WPARAM, lparam: LPARAM) callconv(.
                     pos.y -= @as(f32, @floatFromInt(a.tab_bar_height));
                     if (pos.y < 0) return 0;
                     const mods = getMods();
+                    s.last_cursor_pos = pos;
                     s.core_surface.cursorPosCallback(pos, mods) catch {};
                     _ = s.core_surface.mouseButtonCallback(.release, .right, mods) catch |err| {
                         log.warn("mouseButtonCallback failed: {}", .{err});
@@ -899,6 +902,7 @@ fn wndProc(hwnd: HWND, msg_type: u32, wparam: WPARAM, lparam: LPARAM) callconv(.
                     if (pos.y < 0) return 0;
                     const action = mouseActionFromMsg(msg_type);
                     const mods = getMods();
+                    s.last_cursor_pos = pos;
                     s.core_surface.cursorPosCallback(pos, mods) catch {};
                     _ = s.core_surface.mouseButtonCallback(action, .right, mods) catch |err| {
                         log.warn("mouseButtonCallback failed: {}", .{err});
@@ -914,6 +918,7 @@ fn wndProc(hwnd: HWND, msg_type: u32, wparam: WPARAM, lparam: LPARAM) callconv(.
                     pos.y -= @as(f32, @floatFromInt(a.tab_bar_height));
                     if (pos.y < 0) return 0;
                     const mods = getMods();
+                    s.last_cursor_pos = pos;
                     s.core_surface.cursorPosCallback(pos, mods) catch |err| {
                         log.warn("cursorPosCallback failed: {}", .{err});
                     };
@@ -1723,6 +1728,14 @@ pub const App = struct {
 pub const Surface = struct {
     app: *App,
     core_surface: CoreSurface,
+    /// Latest cursor position in terminal-local coordinates (tab bar already
+    /// subtracted). Updated by every mouse message before cursorPosCallback /
+    /// mouseButtonCallback so that CoreSurface.getCursorPos() can return the
+    /// real click anchor. Stub-returning (0,0) here caused U1: every left
+    /// click anchored selection at line 1 col 0, and the cursorPosCallback
+    /// that runs before the release event then drag-extended the selection
+    /// from (0,0) to the click position.
+    last_cursor_pos: apprt.CursorPos = .{ .x = 0, .y = 0 },
 
     pub fn deinit(self: *Surface) void {
         self.core_surface.deinit();
@@ -1765,8 +1778,7 @@ pub const Surface = struct {
     }
 
     pub fn getCursorPos(self: *const Surface) !apprt.CursorPos {
-        _ = self;
-        return .{ .x = 0, .y = 0 };
+        return self.last_cursor_pos;
     }
 
     pub fn supportsClipboard(self: *const Surface, clipboard: apprt.Clipboard) bool {
