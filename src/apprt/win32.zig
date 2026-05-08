@@ -657,23 +657,24 @@ fn writeClipboardUtf8(text: []const u8) !void {
 // ── IME helpers ────────────────────────────────────────
 
 fn readCompositionString(himc: ?HIMC, flags: u32, alloc: Allocator) ![]u8 {
-    const len = ImmGetCompositionStringW(himc, flags, null, 0);
-    if (len <= 0) return &[_]u8{};
+    // ImmGetCompositionStringW with size=0 returns required buffer size in BYTES
+    // (excluding any trailing null). Negative is an error code.
+    const byte_len_signed = ImmGetCompositionStringW(himc, flags, null, 0);
+    if (byte_len_signed <= 0) return &[_]u8{};
 
-    // len includes null terminator for some flags
-    const byte_len: u32 = @intCast(len);
-    const buf_len = if (len > 0) @as(usize, @intCast(len)) else 0;
+    const byte_len: u32 = @intCast(byte_len_signed);
+    const code_count: usize = byte_len / 2;
 
-    const utf16_buf = try alloc.alloc(u8, buf_len);
+    // Alloc as []u16 directly so the buffer has u16 alignment (avoids UB
+    // when reinterpreting; previously alloc(u8) + @alignCast risked a panic).
+    const utf16_buf = try alloc.alloc(u16, code_count);
     defer alloc.free(utf16_buf);
 
     _ = ImmGetCompositionStringW(himc, flags, utf16_buf.ptr, byte_len);
 
-    const utf16_slice = @as([*]const u16, @ptrCast(@alignCast(utf16_buf.ptr)))[0 .. buf_len / 2];
-
-    var result = try std.ArrayList(u8).initCapacity(alloc, utf16_slice.len * 3);
+    var result = try std.ArrayList(u8).initCapacity(alloc, code_count * 3);
     errdefer result.deinit(alloc);
-    var it = std.unicode.Utf16LeIterator.init(utf16_slice);
+    var it = std.unicode.Utf16LeIterator.init(utf16_buf);
     while (it.nextCodepoint() catch null) |cp| {
         var buf: [4]u8 = undefined;
         const cp_len = try std.unicode.utf8Encode(cp, &buf);
@@ -934,10 +935,18 @@ fn wndProc(hwnd: HWND, msg_type: u32, wparam: WPARAM, lparam: LPARAM) callconv(.
             return 0;
         },
         WM_IME_SETCONTEXT => {
-            // When IME wants to show its UI, accept it (return 0).
-            // Do NOT call DefWindowProcW — it interferes with IME window creation.
-            if ((lparam & 0xC0000000) != 0) return 0; // ISC_SHOWUI flags
-            return DefWindowProcW(hwnd, msg_type, wparam, lparam);
+            // lparam encodes which IME UI windows the system should show:
+            //   bit 31  = ISC_SHOWUICOMPOSITIONWINDOW (preedit window)
+            //   bits 0..3 = ISC_SHOWUICANDIDATEWINDOW{,2,3,4} (candidate window)
+            // We render preedit ourselves in the terminal grid via
+            // preeditCallback, so suppress the system composition window.
+            // We do NOT have a candidate window UI yet, so let the system
+            // draw it by leaving those bits set and forwarding to DefWindowProcW.
+            // (The previous code "return 0" suppressed ALL IME UI including
+            // the candidate window — users had no way to pick characters.)
+            const ISC_SHOWUICOMPOSITIONWINDOW: usize = 0x80000000;
+            const mask: LPARAM = @bitCast(~ISC_SHOWUICOMPOSITIONWINDOW);
+            return DefWindowProcW(hwnd, msg_type, wparam, lparam & mask);
         },
         WM_IME_STARTCOMPOSITION => {
             if (app) |a| {
@@ -956,24 +965,27 @@ fn wndProc(hwnd: HWND, msg_type: u32, wparam: WPARAM, lparam: LPARAM) callconv(.
                         if (himc) |h| _ = ImmReleaseContext(hwnd, h);
                     }
 
-                    // Read result string (final committed text)
                     if ((wparam & GCS_RESULTSTR) != 0) {
                         const result_text = readCompositionString(himc, GCS_RESULTSTR, a.core_app.alloc) catch null;
                         if (result_text) |text| {
                             defer a.core_app.alloc.free(text);
                             if (text.len > 0) {
-                                // Send committed text as key events with utf8 data
+                                // Match GTK apprt: end preedit before
+                                // committing, with composing=false so the
+                                // terminal exits IME-composing state.
+                                s.core_surface.preeditCallback(null) catch {};
                                 _ = s.core_surface.keyCallback(.{
                                     .action = .press,
                                     .key = .unidentified,
                                     .mods = .{},
+                                    .consumed_mods = .{},
+                                    .composing = false,
                                     .utf8 = text,
                                 }) catch {};
                             }
                         }
                     }
 
-                    // Read composition string (in-progress preedit)
                     if ((wparam & GCS_COMPSTR) != 0) {
                         const comp_text = readCompositionString(himc, GCS_COMPSTR, a.core_app.alloc) catch null;
                         if (comp_text) |text| {
@@ -982,7 +994,6 @@ fn wndProc(hwnd: HWND, msg_type: u32, wparam: WPARAM, lparam: LPARAM) callconv(.
                         }
                     }
 
-                    // Update IME window position
                     if ((wparam & (GCS_COMPSTR | GCS_RESULTSTR)) != 0) {
                         setImePosition(s);
                     }
@@ -1466,6 +1477,13 @@ pub const App = struct {
         const s = self.getActiveSurface() orelse return false;
 
         const vk: u16 = @intCast(wparam & 0xFFFF);
+
+        // IME is processing this key. Skip ToUnicode/keyCallback so the
+        // IME's WM_IME_COMPOSITION path is the sole authority during
+        // Chinese/Japanese/Korean input.
+        const VK_PROCESSKEY: u16 = 0xE5;
+        if (vk == VK_PROCESSKEY) return true;
+
         const scancode: u16 = @intCast((lparam >> 16) & 0xFF);
         const extended = ((lparam >> 24) & 1) != 0;
         const was_down = ((lparam >> 30) & 1) != 0;
@@ -1537,11 +1555,11 @@ pub const App = struct {
             if (ret == 0) break;
             if (ret < 0) return error.GetMessageFailed;
 
-            // Skip TranslateMessage for keyboard messages to avoid
-            // interfering with our ToUnicode-based text input in WM_KEYDOWN.
-            if (msg.message < WM_KEYFIRST or msg.message > WM_KEYLAST) {
-                _ = TranslateMessage(&msg);
-            }
+            // Always call TranslateMessage — it is required for IME to see
+            // keystrokes (it generates WM_IME_* messages from WM_KEYDOWN).
+            // For non-IME input we still rely on ToUnicode in the WM_KEYDOWN
+            // handler; WM_CHAR generated here falls through to DefWindowProcW.
+            _ = TranslateMessage(&msg);
             _ = DispatchMessageW(&msg);
 
             self.core_app.tick(self) catch |err| {
@@ -1553,7 +1571,13 @@ pub const App = struct {
     pub fn terminate(self: *App) void {
         const alloc = self.core_app.alloc;
         for (self.tabs.items) |s| {
+            // Match closeTab's order: deinit -> remove from CoreApp.surfaces
+            // -> free Surface memory. Skipping deleteSurface here leaves a
+            // dangling pointer in CoreApp.surfaces.items, which the later
+            // CoreApp.deinit (defer in main_ghostty) then dereferences ->
+            // use-after-free SEGV on shutdown.
             s.core_surface.deinit();
+            self.core_app.deleteSurface(s);
             alloc.destroy(s);
         }
         for (self.tab_titles.items) |title| alloc.free(title);
