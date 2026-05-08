@@ -306,18 +306,6 @@ extern "kernel32" fn GlobalFree(?*anyopaque) callconv(.winapi) ?*anyopaque;
 extern "gdi32" fn ChoosePixelFormat(HDC, *const PIXELFORMATDESCRIPTOR) callconv(.winapi) c_int;
 extern "gdi32" fn SetPixelFormat(HDC, c_int, *const PIXELFORMATDESCRIPTOR) callconv(.winapi) BOOL;
 extern "gdi32" fn SwapBuffers(HDC) callconv(.winapi) BOOL;
-extern "gdi32" fn CreateSolidBrush(u32) callconv(.winapi) ?*anyopaque;
-extern "user32" fn FillRect(HDC, *const RECT, ?*anyopaque) callconv(.winapi) c_int;
-extern "gdi32" fn DeleteObject(?*anyopaque) callconv(.winapi) BOOL;
-
-fn win32CreateSolidBrush(rgb: u32) ?*anyopaque {
-    // COLORREF = 0x00BBGGRR
-    const r = (rgb >> 16) & 0xFF;
-    const g = (rgb >> 8) & 0xFF;
-    const b = rgb & 0xFF;
-    const colorref = (r) | (g << 8) | (b << 16);
-    return CreateSolidBrush(colorref);
-}
 
 // ── WGL extern functions ──────────────────────────────
 extern "opengl32" fn wglCreateContext(HDC) callconv(.winapi) ?HGLRC;
@@ -1424,39 +1412,54 @@ pub const App = struct {
             gl.clear(gl.c.GL_COLOR_BUFFER_BIT);
         }
 
-        // Phase 2: Swap — terminal is now in the front buffer.
-        _ = SwapBuffers(hdc);
-
-        // Phase 3: Draw GDI tab bar directly onto the front buffer.
-        // On the next frame, SwapBuffers moves this front buffer to back,
-        // but GL only blits to the bottom (terminal) area, preserving the
-        // tab bar at the top of the back buffer.
+        // Phase 2: Draw tab bar via OpenGL into the back buffer (U4 fix).
+        // GDI is incompatible with WGL double buffering: FillRect targets the
+        // front buffer, but SwapBuffers swaps it to the back -> invisible.
+        // glScissor + glClear paints solid rects in the back buffer, so the
+        // tab bar persists through SwapBuffers.
+        // GL coords origin is bottom-left, so y_gl = win_h - tab_h.
         if (self.tabs.items.len > 1) {
             const tab_h = self.tab_bar_height;
             const w = self.viewport_width;
+            const win_h = self.viewport_height;
+            const tab_top_y_gl = win_h - tab_h;
 
-            const bg_brush = win32CreateSolidBrush(0x242428);
-            var bg_rect: RECT = .{ .left = 0, .top = 0, .right = w, .bottom = tab_h };
-            _ = FillRect(hdc, &bg_rect, bg_brush);
-            _ = DeleteObject(bg_brush);
+            gl.viewport(0, 0, w, win_h) catch {};
+            // Disable sRGB write so 0xRRGGBB byte values land verbatim in the
+            // framebuffer (renderer leaves GL_FRAMEBUFFER_SRGB enabled).
+            gl.disable(gl.c.GL_FRAMEBUFFER_SRGB) catch {};
+            defer gl.enable(gl.c.GL_FRAMEBUFFER_SRGB) catch {};
+            gl.enable(gl.c.GL_SCISSOR_TEST) catch {};
+            defer gl.disable(gl.c.GL_SCISSOR_TEST) catch {};
+
+            // Background strip across the full width.
+            gl.scissor(0, tab_top_y_gl, w, tab_h) catch {};
+            gl.clearColor(@as(f32, 0x24) / 255.0, @as(f32, 0x24) / 255.0, @as(f32, 0x28) / 255.0, 1.0);
+            gl.clear(gl.c.GL_COLOR_BUFFER_BIT);
 
             const tab_count: c_int = @intCast(self.tabs.items.len);
             const tab_w: c_int = @divTrunc(w, tab_count);
             const clamped_w: c_int = @min(tab_w, 200);
             const padding: c_int = 2;
+            const bw: c_int = @max(1, clamped_w - 2 * padding);
+            const bh: c_int = @max(1, tab_h - 2 * padding);
 
             for (self.tabs.items, 0..) |_, i| {
                 const x: c_int = @as(c_int, @intCast(i)) * clamped_w + padding;
-                const bw: c_int = @max(1, clamped_w - 2 * padding);
-                const bh: c_int = @max(1, tab_h - 2 * padding);
+                const y_gl: c_int = tab_top_y_gl + padding;
                 const is_active = (i == self.active_tab);
-                const color: u32 = if (is_active) @as(u32, 0x333340) else @as(u32, 0x26262C);
-                const brush = win32CreateSolidBrush(color);
-                var rect: RECT = .{ .left = x, .top = padding, .right = x + bw, .bottom = padding + bh };
-                _ = FillRect(hdc, &rect, brush);
-                _ = DeleteObject(brush);
+                if (is_active) {
+                    gl.clearColor(@as(f32, 0x33) / 255.0, @as(f32, 0x33) / 255.0, @as(f32, 0x40) / 255.0, 1.0);
+                } else {
+                    gl.clearColor(@as(f32, 0x26) / 255.0, @as(f32, 0x26) / 255.0, @as(f32, 0x2C) / 255.0, 1.0);
+                }
+                gl.scissor(x, y_gl, bw, bh) catch {};
+                gl.clear(gl.c.GL_COLOR_BUFFER_BIT);
             }
         }
+
+        // Phase 3: Swap — back buffer (terminal + tab bar) becomes front.
+        _ = SwapBuffers(hdc);
     }
 
     fn handleKeyInput(self: *App, wparam: WPARAM, lparam: LPARAM, is_release: bool) bool {

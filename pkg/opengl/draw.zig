@@ -77,6 +77,11 @@ pub fn viewport(x: c.GLint, y: c.GLint, width: c.GLsizei, height: c.GLsizei) !vo
     glad.context.Viewport.?(x, y, width, height);
 }
 
+pub fn scissor(x: c.GLint, y: c.GLint, width: c.GLsizei, height: c.GLsizei) !void {
+    glad.context.Scissor.?(x, y, width, height);
+    try errors.getError();
+}
+
 pub fn pixelStore(mode: c.GLenum, value: anytype) !void {
     switch (@typeInfo(@TypeOf(value))) {
         .ComptimeInt, .Int => glad.context.PixelStorei.?(mode, value),
