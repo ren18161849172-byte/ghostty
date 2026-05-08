@@ -4558,6 +4558,20 @@ pub fn finalize(self: *Config) !void {
     // specific variable use sites for more details.
     const probable_cli = probableCliEnvironment();
 
+    // Win-Ghostty default font chain. Only applied if the user hasn't
+    // configured `font-family` themselves. Order: Cascadia Mono (preferred,
+    // ships with Windows 11 / Terminal), Consolas (always available on
+    // Windows 7+), Microsoft YaHei UI (CJK fallback). Emoji + Nerd Font
+    // glyphs are bundled by Ghostty Core (see SharedGridSet) so we don't
+    // need to enumerate them here.
+    if (comptime builtin.os.tag == .windows) {
+        if (self.@"font-family".count() == 0) {
+            try self.@"font-family".parseCLI(alloc, "Cascadia Mono");
+            try self.@"font-family".parseCLI(alloc, "Consolas");
+            try self.@"font-family".parseCLI(alloc, "Microsoft YaHei UI");
+        }
+    }
+
     // If we have a font-family set and don't set the others, default
     // the others to the font family. This way, if someone does
     // --font-family=foo, then we try to get the stylized versions of
@@ -10966,4 +10980,37 @@ test "compatibility: window new-window" {
             cfg.@"macos-dock-drop-behavior",
         );
     }
+}
+
+test "win32 default font-family chain: Cascadia Mono, Consolas, CJK fallback" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    // No user config — finalize should populate Win-Ghostty's defaults.
+    var cfg = try Config.default(alloc);
+    defer cfg.deinit();
+    try cfg.finalize();
+
+    try testing.expect(cfg.@"font-family".count() >= 3);
+    try testing.expectEqualStrings("Cascadia Mono", cfg.@"font-family".list.items[0]);
+    try testing.expectEqualStrings("Consolas", cfg.@"font-family".list.items[1]);
+    try testing.expectEqualStrings("Microsoft YaHei UI", cfg.@"font-family".list.items[2]);
+}
+
+test "win32 default font-family does not override user font-family" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var cfg = try Config.default(alloc);
+    defer cfg.deinit();
+    var it: TestIterator = .{ .data = &.{"--font-family=Iosevka"} };
+    try cfg.loadIter(alloc, &it);
+    try cfg.finalize();
+
+    try testing.expectEqual(@as(usize, 1), cfg.@"font-family".count());
+    try testing.expectEqualStrings("Iosevka", cfg.@"font-family".list.items[0]);
 }

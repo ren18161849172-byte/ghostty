@@ -194,6 +194,7 @@ const IDC_ARROW: [*:0]const u16 = @ptrFromInt(32512);
 const SWP_NOZORDER: u32 = 0x0004;
 const SWP_NOACTIVATE: u32 = 0x0010;
 const WM_APP_WAKEUP: u32 = 0x0400;
+const WM_APP_CLOSE_SURFACE: u32 = 0x0401;
 const DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2: isize = -4;
 const MB_ICONERROR: u32 = 0x00000010;
 
@@ -1036,6 +1037,24 @@ fn wndProc(hwnd: HWND, msg_type: u32, wparam: WPARAM, lparam: LPARAM) callconv(.
             }
             return DefWindowProcW(hwnd, msg_type, wparam, lparam);
         },
+        WM_APP_CLOSE_SURFACE => {
+            // Posted by performAction(.show_child_exited) so closeTab runs
+            // OUTSIDE the surface.handleMessage call stack. Closing a tab
+            // synchronously from the action handler use-after-frees the
+            // surface that's still active on the stack (childExited holds
+            // *Surface across the action call).
+            if (app) |a| {
+                const surface_ptr: usize = @bitCast(lparam);
+                const surface: *Surface = @ptrFromInt(surface_ptr);
+                for (a.tabs.items, 0..) |tab_surface, i| {
+                    if (tab_surface == surface) {
+                        a.closeTab(i);
+                        break;
+                    }
+                }
+            }
+            return 0;
+        },
         WM_APP_WAKEUP => {
             if (app) |a| {
                 if (a.hwnd) |hw| _ = InvalidateRect(hw, null, 0);
@@ -1710,10 +1729,18 @@ pub const App = struct {
                         if (self.hwnd) |hwnd| _ = DestroyWindow(hwnd);
                     },
                     .surface => |surface_ptr| {
-                        for (self.tabs.items, 0..) |tab_surface, i| {
-                            if (@intFromPtr(tab_surface) == @intFromPtr(surface_ptr)) {
-                                self.closeTab(i);
-                                break;
+                        // Defer closeTab to a posted message: this action is
+                        // dispatched from inside Surface.childExited, which
+                        // still holds *Surface on its stack. Closing the tab
+                        // synchronously deinits + frees the surface and the
+                        // childExited frame then dereferences freed memory.
+                        if (self.hwnd) |hwnd| {
+                            for (self.tabs.items) |tab_surface| {
+                                if (@intFromPtr(tab_surface) == @intFromPtr(surface_ptr)) {
+                                    const lparam: LPARAM = @bitCast(@as(usize, @intFromPtr(tab_surface)));
+                                    _ = PostMessageW(hwnd, WM_APP_CLOSE_SURFACE, 0, lparam);
+                                    break;
+                                }
                             }
                         }
                     },
